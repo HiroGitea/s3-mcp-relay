@@ -57,7 +57,11 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             label: macos-aarch64
-          - os: macos-13
+          # Cross-compiled from the arm64 runner rather than built on macos-13.
+          # Xcode carries both slices, so this needs nothing but the target —
+          # and the macos-13 pool is scarce enough that jobs sat queued for
+          # longer than every other target took to build combined.
+          - os: macos-14
             target: x86_64-apple-darwin
             label: macos-x86_64
 
