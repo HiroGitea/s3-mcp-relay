@@ -1067,7 +1067,13 @@ async fn main() -> Result<()> {
         for agent in paired {
             validate_agent_id(&agent.id)?;
             let shared = common::pairing::derive_key(&controller_private, &agent.public_key, &agent.id)?;
-            transports.insert(agent.id, Transport::connect(&s3, Crypto::from_base64(&shared, "x25519-v1")?).await?);
+            // The shared constant, not a literal: an agent defaults to exactly
+            // this id, and a mismatch means every object either side writes is
+            // rejected by the other.
+            transports.insert(
+                agent.id,
+                Transport::connect(&s3, Crypto::from_base64(&shared, common::crypto::PAIRED_KEY_ID)?).await?,
+            );
         }
     }
     if transports.is_empty() { anyhow::bail!("no agents enrolled; run s3-relay-mcp add <pairing-code>"); }

@@ -18,6 +18,21 @@ use serde::{Deserialize, Serialize};
 const ENVELOPE_VERSION: u32 = 1;
 const AAD_DOMAIN: &[u8] = b"s3-mcp-relay/v1\0";
 
+/// Key id stamped on every object whose key came from X25519 enrolment.
+///
+/// Both ends must choose the same string or nothing decrypts, so neither is
+/// allowed to spell it out: the controller derives a key per agent and seals
+/// with this, and an enrolled agent expects exactly this. It was previously
+/// written as a literal on the controller side while the agent fell back to
+/// `"primary"` — the shared-key default — so every command a paired agent
+/// received was discarded as a key id mismatch, and `relay-agent init` had no
+/// way to know it needed to say otherwise.
+pub const PAIRED_KEY_ID: &str = "x25519-v1";
+
+/// Key id for the older deployment style, where one key is configured on both
+/// sides by hand as `RELAY_SHARED_KEY`.
+pub const SHARED_KEY_ID: &str = "primary";
+
 #[derive(Clone)]
 pub struct Crypto {
     cipher: XChaCha20Poly1305,
@@ -33,18 +48,28 @@ struct Envelope {
 }
 
 impl Crypto {
-    /// Reads a base64-encoded 32-byte key from `RELAY_SHARED_KEY`.
+    /// Build from configuration: a hand-configured `RELAY_SHARED_KEY`, or the
+    /// key derived from X25519 enrolment.
+    ///
+    /// The default key id follows the same branch as the key itself. It has to:
+    /// a derived key is always sealed by the controller as [`PAIRED_KEY_ID`],
+    /// so defaulting an enrolled agent to the shared-key id instead left the
+    /// two ends unable to read each other's objects at all.
     pub fn from_env() -> Result<Self> {
-        let encoded = match crate::optional_env("RELAY_SHARED_KEY") {
-            Some(value) => value,
+        let (encoded, default_key_id) = match crate::optional_env("RELAY_SHARED_KEY") {
+            Some(value) => (value, SHARED_KEY_ID),
             None => {
                 let private = crate::required_env("AGENT_PRIVATE_KEY")?;
                 let controller = crate::required_env("AGENT_CONTROLLER_PUBLIC_KEY")?;
                 let agent = crate::required_env("RELAY_AGENT_ID")?;
-                crate::pairing::derive_key(&private, &controller, &agent)?
+                (
+                    crate::pairing::derive_key(&private, &controller, &agent)?,
+                    PAIRED_KEY_ID,
+                )
             }
         };
-        let key_id = crate::optional_env("RELAY_KEY_ID").unwrap_or_else(|| "primary".into());
+        let key_id =
+            crate::optional_env("RELAY_KEY_ID").unwrap_or_else(|| default_key_id.to_owned());
         Self::from_base64(&encoded, key_id)
     }
 
@@ -213,6 +238,38 @@ mod tests {
         assert_eq!(opened, payload);
         // A chunk moved to another key must not authenticate.
         assert!(crypto.open_bytes("relay/blob/a/t/00000002", &sealed).is_err());
+    }
+
+    #[test]
+    fn the_two_key_ids_are_distinct_and_stable() {
+        // Both sides of an enrolled pair default to PAIRED_KEY_ID, and the two
+        // deployment styles must stay distinguishable. Changing either string
+        // breaks every deployment already in the field.
+        assert_eq!(PAIRED_KEY_ID, "x25519-v1");
+        assert_eq!(SHARED_KEY_ID, "primary");
+        assert_ne!(PAIRED_KEY_ID, SHARED_KEY_ID);
+    }
+
+    #[test]
+    fn a_key_id_mismatch_is_refused_rather_than_misread() {
+        let key = B64.encode([5u8; 32]);
+        let controller = Crypto::from_base64(&key, PAIRED_KEY_ID).unwrap();
+        let agent_wrong = Crypto::from_base64(&key, SHARED_KEY_ID).unwrap();
+        let sealed = controller
+            .seal("relay/cmd/a/1.json", &Sample { value: "ok".into() })
+            .unwrap();
+
+        // The regression: same key, different id, and every command discarded.
+        let error = agent_wrong
+            .open::<Sample>("relay/cmd/a/1.json", &sealed)
+            .expect_err("a mismatched key id must not decrypt");
+        assert!(error.to_string().contains("key id mismatch"));
+
+        let agent_right = Crypto::from_base64(&key, PAIRED_KEY_ID).unwrap();
+        assert_eq!(
+            agent_right.open::<Sample>("relay/cmd/a/1.json", &sealed).unwrap(),
+            Sample { value: "ok".into() }
+        );
     }
 
     #[test]
