@@ -9,7 +9,11 @@ User=s3-relay
 Group=s3-relay
 EnvironmentFile=/etc/s3-relay/agent.env
 ExecStart=/usr/local/bin/relay-agent
-Restart=on-failure
+# Always, not on-failure: after installing an update the agent exits on purpose
+# so it can restart into the new binary, and under on-failure a clean exit would
+# stop the service instead. It exits non-zero (70) precisely so that an older
+# unit still recovers, but this is what the setting should be.
+Restart=always
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
@@ -17,6 +21,17 @@ ProtectSystem=strict
 ProtectHome=true
 # Add only the directories declared in AGENT_ALLOWED_ROOTS.
 ReadWritePaths=/srv/legacy-app
+# Job output, shipped logs, and the update state file.
+ReadWritePaths=/var/lib/relay-agent
+# Required for automatic updates: ProtectSystem=strict makes the entire
+# hierarchy read-only, so without this the agent cannot replace its own binary
+# and every update fails with a read-only filesystem error.
+#
+# Drop this line and set AGENT_AUTO_UPDATE=false together if you would rather
+# this host only ever be updated by hand. A confined agent that can rewrite its
+# own executable can arrange to run anything as this user after a restart, which
+# is a real widening of what the sandbox above is holding back.
+ReadWritePaths=/usr/local/bin
 
 [Install]
 WantedBy=multi-user.target

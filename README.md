@@ -178,6 +178,7 @@ Restart the MCP client and invoke `list_agents`.
 | `read_file` · `write_file` | ≤1 MiB, content passes through the conversation |
 | `push_file` · `pull_file` | Any size, streamed through the bucket |
 | `list_dir` · `make_dir` · `remove` · `move_path` | Path management |
+| `publish_update` · `update_status` · `retract_update` | Roll a new agent binary out to the fleet |
 
 ### Tool selection
 
@@ -312,7 +313,56 @@ and can take hours, and a shared loop would let the heartbeat go stale and make
 a busy agent look dead.
 
 **Layout.** `cmd/<agent>/`, `resp/<agent>/`, `agents/<agent>.json`,
-`doorbell/<agent>.json`, `blob/<agent>/<transfer>/`.
+`doorbell/<agent>.json`, `blob/<agent>/<transfer>/`,
+`updates/manifest/<agent>.json`, `updates/blob/<release>/`.
+
+## Fleet updates
+
+The controller publishes a new `relay-agent` binary into the bucket and every
+agent installs it on its own. There is no inbound connection to make and no
+machine to log into, which is the same constraint that motivated the relay.
+
+```text
+publish_update(local_path="target/aarch64-unknown-linux-gnu/release/relay-agent")
+```
+
+An update is deliberately **not** a command. Commands expire in minutes and are
+consumed once, so any machine that happened to be rebooting during a rollout
+would miss it forever. The manifest instead waits in the bucket, and an agent
+that has been off for a week installs it the moment it comes back.
+
+**One upload, any number of agents.** Sealing a 15 MB binary separately for each
+machine would multiply the controller's upload by the fleet size. Instead the
+binary is encrypted once under a random per-release key, and only that key
+travels per-agent, inside a few hundred bytes of manifest sealed with the
+agent's own key. The bucket still never holds anything readable.
+
+**Mixed architectures.** The platform is read out of the binary's own header and
+recorded in the manifest; an agent whose platform differs refuses the release
+rather than exec-ing a foreign binary. Publish once per architecture — the
+matching agents take it and the rest report why they did not.
+
+Before an agent replaces anything it checks that the release is for its
+platform, that its own binary does not already hash to the published one, that
+the manifest is newer than the last one it applied, that no job is running, and
+finally that the downloaded binary actually starts and answers `--version`. Only
+then does it move the old binary aside and restart into the new one; if the new
+binary will not run, the old one is put back. `update_status` shows what each
+agent is running against what has been published, and `retract_update` stops a
+rollout that has not reached everyone yet.
+
+Two deployment details matter, and both are already in the shipped unit:
+
+* `Restart=always`, because the agent exits on purpose to restart into the new
+  binary. Under `Restart=on-failure` a clean exit would stop the service, which
+  is why the agent exits non-zero (70) instead.
+* `ReadWritePaths` covering the install directory, or `ProtectSystem=strict`
+  makes every update fail on a read-only filesystem.
+
+Set `agent.auto_update = false` to opt a host out. On a `--restricted` install
+this is worth thinking about: an agent that can rewrite its own executable can
+run anything as its service user after a restart, which is a real widening of
+what the sandbox is otherwise holding back.
 
 ## Storage requirements
 
@@ -320,7 +370,10 @@ Ephemeral transport depends on the following bucket configuration:
 
 1. Dedicated bucket or prefix; versioning and Object Lock **off**, or deletes
    only create delete markers.
-2. A short lifecycle rule as a backstop for crashes.
+2. A short lifecycle rule as a backstop for crashes, applied **per prefix** —
+   see `deploy/s3-lifecycle.example.json`. A single rule over the whole prefix
+   would also expire published updates, and with them the ability of an offline
+   machine to ever catch up.
 3. No replication, archival, or access logs containing payloads.
 4. Server-side encryption is fine but does not replace the end-to-end layer.
 5. TLS enforced by bucket policy; separate identities for controller and agent.

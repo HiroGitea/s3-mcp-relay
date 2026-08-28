@@ -34,6 +34,10 @@ MODE="full"
 RUN_AS=""
 ALLOWED_ROOTS=""
 NO_START=0
+# Empty means "decide from MODE": on by default for a full-capability host,
+# off for a restricted one, where letting the agent rewrite its own executable
+# would undo much of what the sandbox is there to do.
+AUTO_UPDATE=""
 
 usage() {
     cat <<'USAGE'
@@ -61,6 +65,10 @@ Optional:
   --allowed-roots LIST   Colon-separated roots for --restricted mode
   --run-as USER          Override the service user
   --no-start             Install and enable, but do not start
+  --auto-update          Install binaries the controller publishes with
+                         publish_update (default: on in full mode, off when
+                         --restricted)
+  --no-auto-update       Only ever update this host by hand
   -h, --help             This text
 
 Default mode is full capability: runs as root, exec can run any program, file
@@ -95,6 +103,8 @@ while [ $# -gt 0 ]; do
         --allowed-roots) need_value "$1" "${2:-}"; ALLOWED_ROOTS=$2; shift 2 ;;
         --run-as)        need_value "$1" "${2:-}"; RUN_AS=$2; shift 2 ;;
         --restricted)    MODE="restricted"; shift ;;
+        --auto-update)   AUTO_UPDATE=1; shift ;;
+        --no-auto-update) AUTO_UPDATE=0; shift ;;
         --no-start)      NO_START=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               usage >&2; die "unknown option $1" ;;
@@ -105,6 +115,10 @@ done
 
 if [ -z "$RUN_AS" ]; then
     if [ "$MODE" = "restricted" ]; then RUN_AS="s3-relay"; else RUN_AS="root"; fi
+fi
+
+if [ -z "$AUTO_UPDATE" ]; then
+    if [ "$MODE" = "restricted" ]; then AUTO_UPDATE=0; else AUTO_UPDATE=1; fi
 fi
 
 # --- locate and sanity check the binary ------------------------------------
@@ -274,6 +288,12 @@ full_scan_secs     = 60
 doorbell           = true
 heartbeat_secs     = 15
 heartbeat_ttl_secs = 45
+
+# Install binaries the controller publishes with publish_update. The agent
+# refuses a release built for another platform, waits for running jobs to
+# finish before restarting, and rolls back if the new binary will not start.
+auto_update       = $([ "$AUTO_UPDATE" = "1" ] && echo true || echo false)
+update_check_secs = 300
 EOF
     chmod 0600 "$CONF_FILE"
     echo "wrote $CONF_FILE (mode 0600)"
@@ -294,11 +314,20 @@ fi
 case "$INIT" in
 systemd)
     if [ "$MODE" = "restricted" ]; then
+        # ProtectSystem=strict makes the whole hierarchy read-only, so the
+        # install directory has to be granted back explicitly or every
+        # self-update fails on a read-only filesystem. Only granted when
+        # auto-update is actually on: an agent that can rewrite its own
+        # executable can run anything as this user after a restart.
+        update_paths=""
+        [ "$AUTO_UPDATE" = "1" ] && update_paths="
+ReadWritePaths=$BIN_DIR"
         hardening="NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$(printf '%s' "$ALLOWED_ROOTS" | tr ':' ' ')"
+ReadWritePaths=$(printf '%s' "$ALLOWED_ROOTS" | tr ':' ' ')
+ReadWritePaths=/var/lib/relay-agent$update_paths"
     else
         # Deliberately unsandboxed: confining the unit here would silently undo
         # allow_any_path and produce confusing permission errors instead.
@@ -315,7 +344,10 @@ Type=simple
 User=$RUN_AS
 Environment=RELAY_CONFIG=$CONF_FILE
 ExecStart=$BIN_DIR/relay-agent
-Restart=on-failure
+# Always, not on-failure: after installing an update the agent exits on purpose
+# so it can restart into the new binary, and on-failure would treat a clean exit
+# as a reason to stop the service.
+Restart=always
 RestartSec=5
 $hardening
 

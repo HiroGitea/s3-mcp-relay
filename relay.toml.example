@@ -137,6 +137,22 @@ private_key = "replace-with-agent-x25519-private-key"
 public_key = "replace-with-agent-x25519-public-key"
 controller_public_key = "replace-with-controller-public-key"
 
+# Install binaries the controller publishes with publish_update.
+#
+# Five things are checked before this agent replaces itself: the release targets
+# this platform, its own binary does not already match it, the manifest is newer
+# than the last one applied, no job is running, and the downloaded binary
+# actually starts and answers --version. A failed install rolls back.
+#
+# The install directory has to be writable by the agent. Under
+# ProtectSystem=strict that means a ReadWritePaths entry for it, or every update
+# fails on a read-only filesystem. On a restricted host, consider leaving this
+# off instead: an agent that can rewrite its own executable can arrange to run
+# anything as its service user after a restart.
+auto_update = true
+# One HEAD per interval while nothing has changed.
+update_check_secs = 300
+
 # Local logs are encrypted and uploaded incrementally to the controller. Only
 # completed/rotated local files are eligible for cleanup; running jobs remain.
 job_dir = "/var/lib/relay-agent/jobs"

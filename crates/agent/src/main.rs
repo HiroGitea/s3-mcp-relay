@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use common::protocol::{now_unix, EventKind};
+use common::update::{self, Outcome};
 use common::{optional_env, required_env, validate_agent_id, Crypto, Heartbeat, Response, S3Config, Transport};
 use events::EventLog;
 use executor::Policy;
@@ -117,15 +118,137 @@ async fn main() -> Result<()> {
         collector,
     ));
 
-    let result = run_loop(&transport, &agent_id, &policy, &poll, &log, &job_manager).await;
+    // One slot is enough: the update task sends exactly once and then stops.
+    let (update_tx, update_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let auto_update = optional_env("AGENT_AUTO_UPDATE")
+        .map_or(true, |value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"));
+    let updates = if auto_update {
+        let every = Duration::from_secs(bounded_env("AGENT_UPDATE_CHECK_SECS", 300, 60, 86_400)?);
+        info!(interval_secs = every.as_secs(), "automatic updates enabled");
+        Some(tokio::spawn(update_loop(
+            transport.clone(),
+            agent_id.clone(),
+            job_dir.join("update-state.json"),
+            every,
+            log.clone(),
+            job_manager.clone(),
+            update_tx,
+        )))
+    } else {
+        info!("automatic updates disabled");
+        None
+    };
+
+    let result = run_loop(&transport, &agent_id, &policy, &poll, &log, &job_manager, update_rx).await;
 
     heartbeat.abort();
     shipping.abort();
     cleanup.abort();
+    if let Some(updates) = updates { updates.abort(); }
     if let Err(error) = transport.delete_heartbeat(&agent_id).await {
         warn!(%error, "could not remove heartbeat during shutdown");
     }
-    result
+
+    match result? {
+        Shutdown::Signal => Ok(()),
+        Shutdown::Updated(version) => {
+            info!(%version, "restarting into the updated binary");
+            // process::exit runs no destructors, and the non-blocking log writer
+            // needs its guard dropped or the last lines — including this one —
+            // never reach the file.
+            drop(_log_guard);
+            std::process::exit(update::EXIT_UPDATED);
+        }
+    }
+}
+
+/// Why the command loop stopped.
+enum Shutdown {
+    Signal,
+    /// A new binary is in place; the process must exit so its supervisor starts
+    /// it again. Carries the version only for the log line.
+    Updated(String),
+}
+
+/// Poll for a build the controller published, and install it when the agent is
+/// idle enough to restart.
+///
+/// Runs on its own task, so a check never delays a command, and an install can
+/// finish downloading while a command is still executing — the binary on disk
+/// is not the one in memory, so replacing it disturbs nothing until the process
+/// actually exits.
+#[allow(clippy::too_many_arguments)]
+async fn update_loop(
+    transport: Transport,
+    agent_id: String,
+    state_path: PathBuf,
+    every: Duration,
+    log: EventLog,
+    jobs: JobManager,
+    done: tokio::sync::mpsc::Sender<String>,
+) {
+    // The ETag of the manifest whose outcome is already decided, so a fleet
+    // sitting on the current release costs one HEAD per interval and nothing
+    // else. `None` on the outside means nothing has been decided yet; the inner
+    // `Option` is `None` when no manifest exists at all.
+    let mut settled: Option<Option<String>> = None;
+    // Separately tracked so a deferred update is announced once per manifest
+    // rather than on every retry, which would flood the small event ring that
+    // real errors have to fit into.
+    let mut announced: Option<Option<String>> = None;
+
+    loop {
+        match transport.update_manifest_tag(&agent_id).await {
+            Ok(tag) if settled.as_ref() == Some(&tag) => {}
+            Ok(tag) => {
+                match update::check_and_apply(&transport, &agent_id, &state_path, jobs.running_count()).await {
+                    Ok(Outcome::Applied { version, sha256 }) => {
+                        info!(%version, %sha256, "update installed");
+                        let _ = done.send(version).await;
+                        return;
+                    }
+                    Ok(outcome) => {
+                        match &outcome {
+                            Outcome::None | Outcome::UpToDate => {}
+                            Outcome::Deferred { jobs_running } => {
+                                info!(jobs_running, "update held back until running jobs finish");
+                                if announced.as_ref() != Some(&tag) {
+                                    announced = Some(tag.clone());
+                                    log.record(
+                                        EventKind::Update,
+                                        format!("update ready; waiting for {jobs_running} running job(s)"),
+                                    );
+                                }
+                            }
+                            Outcome::Skipped { reason } => {
+                                warn!(%reason, "published update skipped");
+                                if announced.as_ref() != Some(&tag) {
+                                    announced = Some(tag.clone());
+                                    log.record(EventKind::Update, format!("update skipped: {reason}"));
+                                }
+                            }
+                            Outcome::Applied { .. } => unreachable!("handled above"),
+                        }
+                        if outcome.is_settled() {
+                            settled = Some(tag);
+                        }
+                    }
+                    Err(error) => {
+                        // Left unsettled on purpose, so the next tick retries: a
+                        // transient S3 error must not park the agent on an old
+                        // build until someone republishes.
+                        warn!(%error, "update failed");
+                        log.record(EventKind::Update, format!("update failed: {error:#}"));
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(%error, "update check failed");
+                log.record(EventKind::Update, format!("update check failed: {error:#}"));
+            }
+        }
+        tokio::time::sleep(every).await;
+    }
 }
 
 async fn heartbeat_loop(
@@ -207,7 +330,8 @@ async fn run_loop(
     poll: &PollPolicy,
     log: &EventLog,
     jobs: &JobManager,
-) -> Result<()> {
+    mut updated: tokio::sync::mpsc::Receiver<String>,
+) -> Result<Shutdown> {
     let mut interval = poll.active;
     let mut seen_doorbell: Option<String> = None;
     // Set to now so the very first tick lists unconditionally and picks up
@@ -284,8 +408,12 @@ async fn run_loop(
             (interval * 2).min(poll.idle)
         };
 
+        // Reached only between commands, never during one: an update restart
+        // therefore never interrupts work that is already running, it only
+        // takes effect once the agent is idle.
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => { info!("shutdown signal received"); return Ok(()); }
+            _ = tokio::signal::ctrl_c() => { info!("shutdown signal received"); return Ok(Shutdown::Signal); }
+            Some(version) = updated.recv() => { return Ok(Shutdown::Updated(version)); }
             _ = tokio::time::sleep(interval) => {}
         }
     }

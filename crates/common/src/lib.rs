@@ -10,6 +10,10 @@
 //! An S3-compatible bucket is the only shared medium. It is treated as a pure
 //! *transit* buffer: every object is deleted by whoever consumes it, so nothing
 //! is meant to persist. See [`transport`] for the object-key layout.
+//!
+//! [`update`] is the one exception: a published build has to outlive the moment
+//! it was published, or a machine that was offline during the rollout could
+//! never catch up.
 
 pub mod blob;
 pub mod config;
@@ -17,12 +21,13 @@ pub mod crypto;
 pub mod pairing;
 pub mod protocol;
 pub mod transport;
+pub mod update;
 
 pub use config::{optional_env, required_env, S3Config};
 pub use crypto::Crypto;
 pub use protocol::{
     validate_agent_id, validate_transfer_id, Command, CommandKind, DirEntry, Doorbell, Heartbeat, LogChunk,
-    Response, ResponsePayload,
+    Response, ResponsePayload, UpdateManifest,
 };
 pub use transport::Transport;
 

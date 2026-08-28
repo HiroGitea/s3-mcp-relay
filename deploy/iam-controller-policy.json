@@ -42,6 +42,24 @@
         "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/resp/REPLACE_AGENT/*",
         "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/agents/*"
       ]
+    },
+    {
+      "Sid": "PublishUpdates",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": [
+        "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/updates/manifest/*",
+        "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/updates/blob/*"
+      ]
+    },
+    {
+      "Sid": "ListReleasesForCleanup",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::REPLACE_BUCKET",
+      "Condition": {
+        "StringLike": { "s3:prefix": ["REPLACE_PREFIX/updates/blob/*"] }
+      }
     }
   ]
 }

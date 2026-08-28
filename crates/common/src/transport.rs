@@ -6,6 +6,11 @@
 //! immediately after copying them into memory. Heartbeats are overwritten and
 //! stale ones are deleted by the controller.
 //!
+//! Two prefixes are not transit and are deliberately *not* consumed on read:
+//! `blob/<agent>/<transfer>/` for bulk file transfers, and
+//! `updates/` for fleet self-updates. Both are pure byte copies with no side
+//! effects, so a failed fetch can simply be retried.
+//!
 //! The doorbell exists so an idle agent does not have to LIST its command
 //! prefix on every tick: LIST is by far the most expensive request here, while
 //! a HEAD against one fixed key is priced like a GET and transfers no body.
@@ -20,7 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
-use crate::protocol::now_unix;
+use crate::protocol::{now_unix, UpdateManifest};
 use crate::{
     validate_agent_id, validate_transfer_id, Command, Crypto, Doorbell, Heartbeat, LogChunk, Response,
     S3Config,
@@ -331,6 +336,123 @@ impl Transport {
         for key in self.list_keys(&self.blob_prefix(agent, transfer)).await? {
             if let Err(error) = self.delete_key(&key).await {
                 tracing::warn!(%key, %error, "could not delete blob chunk");
+            }
+        }
+        Ok(())
+    }
+
+    // --- Fleet updates ------------------------------------------------------
+    //
+    // Two object classes with two different keys, which is the whole point:
+    //
+    //   updates/manifest/<agent>.json   sealed with that agent's key
+    //   updates/blob/<release>/<index>  sealed with the release key
+    //
+    // Only the manifest is per-agent, and it is a few hundred bytes. The
+    // binary is written once for the entire fleet, so publishing to twenty
+    // machines costs one upload rather than twenty. The release key that
+    // unlocks it is carried inside each sealed manifest, so the bucket still
+    // never holds anything an S3 operator could read.
+
+    fn update_manifest_key(&self, agent: &str) -> String {
+        format!("{}updates/manifest/{agent}.json", self.prefix)
+    }
+
+    fn release_prefix(&self, release: &str) -> String {
+        format!("{}updates/blob/{release}/", self.prefix)
+    }
+
+    fn release_chunk_key(&self, release: &str, index: u32) -> String {
+        // Zero padded, like blob chunks, so listing order matches chunk order.
+        format!("{}{index:08}", self.release_prefix(release))
+    }
+
+    pub async fn put_update_manifest(&self, manifest: &UpdateManifest) -> Result<()> {
+        validate_agent_id(&manifest.agent_id)?;
+        validate_transfer_id(&manifest.release)?;
+        self.put_encrypted(&self.update_manifest_key(&manifest.agent_id), manifest).await
+    }
+
+    pub async fn read_update_manifest(&self, agent: &str) -> Result<Option<UpdateManifest>> {
+        validate_agent_id(agent)?;
+        let key = self.update_manifest_key(agent);
+        let Some(manifest) = self.get_encrypted::<UpdateManifest>(&key).await? else {
+            return Ok(None);
+        };
+        // The manifest is AEAD-bound to this key, so it cannot have been copied
+        // from another agent's slot; this catches a controller that published a
+        // mismatched body into its own agent's slot.
+        if manifest.agent_id != agent {
+            anyhow::bail!("update manifest at {key} names a different agent");
+        }
+        validate_transfer_id(&manifest.release)?;
+        Ok(Some(manifest))
+    }
+
+    /// Cheap change check, the same trick as [`doorbell_tag`](Self::doorbell_tag):
+    /// an agent that already installed the current release should not pay for a
+    /// GET every few minutes just to learn nothing changed.
+    pub async fn update_manifest_tag(&self, agent: &str) -> Result<Option<String>> {
+        validate_agent_id(agent)?;
+        let key = self.update_manifest_key(agent);
+        match self.client.head_object().bucket(&self.bucket).key(&key).send().await {
+            Ok(out) => Ok(out.e_tag().map(ToOwned::to_owned)),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_not_found() { return Ok(None); }
+                Err(anyhow::Error::new(svc).context(format!("head_object {key}")))
+            }
+        }
+    }
+
+    pub async fn delete_update_manifest(&self, agent: &str) -> Result<()> {
+        validate_agent_id(agent)?;
+        self.delete_key(&self.update_manifest_key(agent)).await
+    }
+
+    /// Release chunks take an explicit [`Crypto`] because they are sealed with
+    /// the one-off release key rather than this transport's per-agent key.
+    pub async fn put_release_chunk(
+        &self,
+        release: &str,
+        index: u32,
+        data: &[u8],
+        crypto: &Crypto,
+    ) -> Result<()> {
+        validate_transfer_id(release)?;
+        if data.len() > MAX_BLOB_CHUNK_BYTES {
+            anyhow::bail!("release chunk exceeds {MAX_BLOB_CHUNK_BYTES} bytes");
+        }
+        let key = self.release_chunk_key(release, index);
+        let body = crypto.seal_bytes(&key, data)?;
+        self.client.put_object().bucket(&self.bucket).key(&key)
+            .content_type("application/vnd.s3-mcp-relay.chunk")
+            .body(ByteStream::from(body)).send().await
+            .with_context(|| format!("put_object {key}"))?;
+        Ok(())
+    }
+
+    pub async fn get_release_chunk(
+        &self,
+        release: &str,
+        index: u32,
+        crypto: &Crypto,
+    ) -> Result<Option<Vec<u8>>> {
+        validate_transfer_id(release)?;
+        let key = self.release_chunk_key(release, index);
+        match self.get_raw(&key, MAX_BLOB_CHUNK_BYTES).await? {
+            Some(bytes) => Ok(Some(crypto.open_bytes(&key, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Remove every chunk of a release. Controller-side only: agents are not
+    /// granted list or delete on this prefix.
+    pub async fn delete_release(&self, release: &str) -> Result<()> {
+        validate_transfer_id(release)?;
+        for key in self.list_keys(&self.release_prefix(release)).await? {
+            if let Err(error) = self.delete_key(&key).await {
+                tracing::warn!(%key, %error, "could not delete release chunk");
             }
         }
         Ok(())

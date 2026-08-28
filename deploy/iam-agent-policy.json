@@ -47,6 +47,18 @@
       "Effect": "Allow",
       "Action": "s3:DeleteObject",
       "Resource": "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/agents/REPLACE_AGENT.json"
+    },
+    {
+      "Sid": "ReadOwnUpdateManifest",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/updates/manifest/REPLACE_AGENT.json"
+    },
+    {
+      "Sid": "DownloadPublishedReleases",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/updates/blob/*"
     }
   ]
 }

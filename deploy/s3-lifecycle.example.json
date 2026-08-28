@@ -1,11 +1,52 @@
 {
   "Rules": [
     {
-      "ID": "expire-relay-safety-net",
+      "ID": "abort-stalled-multipart-uploads",
       "Status": "Enabled",
       "Filter": { "Prefix": "REPLACE_PREFIX/" },
-      "Expiration": { "Days": 1 },
       "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+    },
+    {
+      "ID": "expire-transit-commands",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "REPLACE_PREFIX/cmd/" },
+      "Expiration": { "Days": 1 }
+    },
+    {
+      "ID": "expire-transit-responses",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "REPLACE_PREFIX/resp/" },
+      "Expiration": { "Days": 1 }
+    },
+    {
+      "ID": "expire-transit-heartbeats",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "REPLACE_PREFIX/agents/" },
+      "Expiration": { "Days": 1 }
+    },
+    {
+      "ID": "expire-transit-doorbells",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "REPLACE_PREFIX/doorbell/" },
+      "Expiration": { "Days": 1 }
+    },
+    {
+      "ID": "expire-abandoned-transfers",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "REPLACE_PREFIX/blob/" },
+      "Expiration": { "Days": 1 }
+    },
+    {
+      "ID": "expire-unshipped-logs",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "REPLACE_PREFIX/logs/" },
+      "Expiration": { "Days": 7 }
+    },
+    {
+      "ID": "expire-superseded-releases",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "REPLACE_PREFIX/updates/blob/" },
+      "Expiration": { "Days": 30 }
     }
   ]
 }

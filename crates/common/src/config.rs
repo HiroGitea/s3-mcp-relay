@@ -72,6 +72,8 @@ const KNOWN_KEYS: &[&str] = &[
     "agent.job_max_total_bytes",
     "agent.job_cleanup_interval_secs",
     "agent.job_ship_chunk_bytes",
+    "agent.auto_update",
+    "agent.update_check_secs",
 ];
 
 /// Settings whose presence in the file makes its permissions security-relevant.
@@ -387,7 +389,7 @@ mod tests {
             let (section, field) = dotted.split_once('.').expect("known keys are dotted");
             let env_name = match section {
                 "s3" => format!("S3_{}", field.to_ascii_uppercase()),
-                "agent" if *field == "id" => "RELAY_AGENT_ID".to_owned(),
+                "agent" if field == "id" => "RELAY_AGENT_ID".to_owned(),
                 "agent" => format!("AGENT_{}", field.to_ascii_uppercase()),
                 "controller" => format!("CONTROL_{}", field.to_ascii_uppercase()),
                 "relay" => format!("RELAY_{}", field.to_ascii_uppercase()),

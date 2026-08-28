@@ -413,12 +413,52 @@ pub enum EventKind {
     Command,
     /// A bulk transfer failed.
     Transfer,
+    /// A published update could not be checked or installed — or was held back
+    /// because the agent was busy. The only channel that reports this: an
+    /// update is not a command, so there is no `Response` to carry it home.
+    Update,
 }
 
 impl Heartbeat {
     pub fn is_stale(&self) -> bool {
         now_unix().saturating_sub(self.at) > self.ttl_secs
     }
+}
+
+/// What the controller published for one agent to install, and everything that
+/// agent needs to fetch and trust it.
+///
+/// A fleet update is deliberately *not* a [`Command`]: a command expires after
+/// `queue_ttl_secs` and is consumed at most once, so any machine that happened
+/// to be offline during the rollout would never see it. This manifest instead
+/// sits in the bucket until it is replaced, and every agent picks it up on its
+/// own schedule — including one that comes back a week later.
+///
+/// The binary itself is *not* per-agent. Sealing a 15 MB artifact separately
+/// for every machine would multiply the controller's upload by the fleet size,
+/// so the payload is encrypted once under a random per-release key at a shared
+/// prefix, and only that key travels per-agent, inside this manifest, which is
+/// sealed with the agent's own key like every other object addressed to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateManifest {
+    pub agent_id: AgentId,
+    /// Human-readable label for the build, e.g. `0.2.0`. Reporting only: what
+    /// actually decides whether an agent installs this is `sha256`.
+    pub version: String,
+    /// `"{os} {arch}"`, exactly as the agent reports it. An agent that does not
+    /// match refuses the update rather than exec-ing a foreign binary.
+    pub target: String,
+    /// Names the shared chunk prefix. A UUID: it becomes part of an S3 key.
+    pub release: String,
+    pub chunks: u32,
+    pub total_bytes: u64,
+    /// Lowercase hex SHA-256 of the assembled binary. This is the identity of
+    /// the release: an agent whose own binary already hashes to this is up to
+    /// date, which stays correct even when a version string is reused.
+    pub sha256: String,
+    /// Base64 32-byte key the release chunks are sealed with.
+    pub release_key_b64: String,
+    pub published_at: i64,
 }
 
 /// Tiny object the controller overwrites whenever it enqueues a command, so the

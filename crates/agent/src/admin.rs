@@ -9,8 +9,13 @@ pub fn dispatch() -> Result<bool> {
         "reset" => reset()?,
         "status" => status()?,
         "update" => pairing::update("relay-agent")?,
+        // Also the smoke test a self-update runs against a freshly downloaded
+        // binary before letting it replace this one, so it has to stay trivial:
+        // no config, no network, no filesystem. If this can run, the build is
+        // executable on this machine and correctly linked.
+        "--version" | "-V" | "version" => version(),
         "-h" | "--help" | "help" => help(),
-        _ => bail!("unknown command {command}; use init, reset, status, update, or run without arguments"),
+        _ => bail!("unknown command {command}; use init, reset, status, update, version, or run without arguments"),
     }
     Ok(true)
 }
@@ -61,6 +66,14 @@ fn status() -> Result<()> {
     Ok(())
 }
 
+fn version() {
+    println!(
+        "relay-agent {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        common::update::current_target()
+    );
+}
+
 fn help() {
-    println!("relay-agent [init [name] | reset | status | update]\nRun without arguments to start the agent.");
+    println!("relay-agent [init [name] | reset | status | update | version]\nRun without arguments to start the agent.");
 }

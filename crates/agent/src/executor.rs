@@ -595,4 +595,7 @@ pub fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_owned())
 }
 
-pub fn os_string() -> String { format!("{} {}", std::env::consts::OS, std::env::consts::ARCH) }
+/// What this machine reports as its platform. Shared with the update path, so
+/// the string the controller matches a release against and the string the agent
+/// checks it with cannot drift apart.
+pub fn os_string() -> String { common::update::current_target() }

@@ -20,6 +20,10 @@ use common::{
 /// enough for the archives this exists to move, small enough that a mistaken
 /// path does not try to drag a disk image through the bucket.
 const DEFAULT_PULL_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+/// Ceiling for a published agent binary. Comfortably above any real build, and
+/// low enough that pointing this at a disk image fails immediately instead of
+/// after uploading it to the whole fleet's bucket.
+const MAX_UPDATE_BYTES: u64 = 512 * 1024 * 1024;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock},
@@ -172,6 +176,33 @@ struct PullFileArgs {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PublishUpdateArgs {
+    /// relay-agent binary on this machine, built for the target below.
+    local_path: String,
+    /// Agents to offer it to. Omit for every enrolled agent. Offline agents are
+    /// included on purpose: the manifest waits in the bucket until they return.
+    agents: Option<Vec<String>>,
+    /// Platform the binary is built for, as "{os} {arch}", e.g. "linux x86_64".
+    /// Read from the executable header when omitted. Agents whose platform
+    /// differs refuse the release, so a mixed fleet takes one call per
+    /// architecture.
+    target: Option<String>,
+    /// Version label, for reporting only. Defaults to this controller's own
+    /// version. What actually decides whether an agent installs is the hash.
+    version: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RetractUpdateArgs {
+    /// Agents to withdraw the offer from. Omit for all of them.
+    agents: Option<Vec<String>>,
+    /// Also delete the uploaded binary. Only do this once no agent still needs
+    /// it: an agent that has not checked in yet would find its chunks gone.
+    #[serde(default)]
+    delete_release: bool,
+}
+
 #[tool_router(server_handler)]
 impl Controller {
     #[tool(description = "List currently live relay agents. Stale heartbeat objects are deleted.")]
@@ -313,6 +344,205 @@ impl Controller {
             Ok(value) => self.json_result(&value),
             Err(error) => Ok(tool_error(format!("pull failed: {error:#}"))),
         }
+    }
+
+    #[tool(description = "Publish a new relay-agent binary to the fleet through the bucket. The binary is uploaded once no matter how many agents there are, and each agent installs it on its own schedule — including machines that are offline right now, which pick it up when they return. An agent whose platform does not match refuses it, so a mixed fleet needs one call per architecture. Agents defer the restart until their running jobs finish, and roll back if the new binary fails to start.")]
+    async fn publish_update(&self, Parameters(args): Parameters<PublishUpdateArgs>) -> Result<CallToolResult, McpError> {
+        match self.publish(args).await {
+            Ok(value) => self.json_result(&value),
+            Err(error) => Ok(tool_error(format!("publish failed: {error:#}"))),
+        }
+    }
+
+    #[tool(description = "Show what each agent is running against what has been published to it: version, platform, and whether the published release has been installed yet.")]
+    async fn update_status(&self) -> Result<CallToolResult, McpError> {
+        let mut rows = Vec::new();
+        for (id, transport) in self.transports.iter() {
+            let heartbeat = transport.read_heartbeat(id).await.ok().flatten();
+            let manifest = match transport.read_update_manifest(id).await {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    rows.push(json!({ "agent_id": id, "error": format!("{error:#}") }));
+                    continue;
+                }
+            };
+            rows.push(json!({
+                "agent_id": id,
+                "online": heartbeat.is_some(),
+                "running_version": heartbeat.as_ref().map(|hb| hb.agent_version.clone()),
+                "platform": heartbeat.as_ref().map(|hb| hb.os.clone()),
+                "jobs_running": heartbeat.as_ref().map(|hb| hb.jobs_running),
+                "published": manifest.as_ref().map(|m| json!({
+                    "version": m.version,
+                    "target": m.target,
+                    "sha256": m.sha256,
+                    "published_at": m.published_at,
+                })),
+                // Only meaningful once the agent has checked in since the
+                // publish; an offline agent reports the version it last ran.
+                "installed": match (&manifest, &heartbeat) {
+                    (Some(m), Some(hb)) => Some(hb.agent_version == m.version),
+                    _ => None,
+                },
+            }));
+        }
+        rows.sort_by(|a, b| a["agent_id"].as_str().cmp(&b["agent_id"].as_str()));
+        self.json_result(&rows)
+    }
+
+    #[tool(description = "Withdraw a published update so agents that have not installed it yet will not. Agents that already restarted into it are unaffected — publish the previous binary to move those back.")]
+    async fn retract_update(&self, Parameters(args): Parameters<RetractUpdateArgs>) -> Result<CallToolResult, McpError> {
+        let agents = match self.targets(args.agents) {
+            Ok(agents) => agents,
+            Err(error) => return Ok(tool_error(format!("{error:#}"))),
+        };
+        let mut releases: HashSet<String> = HashSet::new();
+        let mut retracted = Vec::new();
+        for agent in &agents {
+            let Ok(transport) = self.transport_for(agent) else { continue };
+            if args.delete_release {
+                if let Ok(Some(manifest)) = transport.read_update_manifest(agent).await {
+                    releases.insert(manifest.release);
+                }
+            }
+            match transport.delete_update_manifest(agent).await {
+                Ok(()) => retracted.push(agent.clone()),
+                Err(error) => return Ok(tool_error(format!("could not retract {agent}: {error:#}"))),
+            }
+        }
+        let mut deleted = Vec::new();
+        for release in releases {
+            if let Some(transport) = self.transports.values().next() {
+                match transport.delete_release(&release).await {
+                    Ok(()) => deleted.push(release),
+                    Err(error) => return Ok(tool_error(format!("could not delete release: {error:#}"))),
+                }
+            }
+        }
+        self.json_result(&json!({ "retracted": retracted, "releases_deleted": deleted }))
+    }
+
+    async fn publish(&self, args: PublishUpdateArgs) -> Result<serde_json::Value> {
+        let source = PathBuf::from(&args.local_path);
+        let metadata = tokio::fs::metadata(&source)
+            .await
+            .with_context(|| format!("read {}", source.display()))?;
+        if !metadata.is_file() {
+            anyhow::bail!("{} is not a file", source.display());
+        }
+        if metadata.len() == 0 {
+            anyhow::bail!("{} is empty", source.display());
+        }
+        if metadata.len() > MAX_UPDATE_BYTES {
+            anyhow::bail!(
+                "{} is {} bytes, over the {MAX_UPDATE_BYTES} byte ceiling for an update",
+                source.display(),
+                metadata.len()
+            );
+        }
+
+        let target = match args.target {
+            Some(target) => target,
+            None => detect_target(&source).await?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not read a platform from {}; pass target explicitly, e.g. \"linux x86_64\"",
+                    source.display()
+                )
+            })?,
+        };
+        let agents = self.targets(args.agents)?;
+        let version = args.version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+
+        // One upload for the whole fleet: the binary is sealed with a one-off
+        // release key at a shared prefix, and only that key travels per agent.
+        let release = blob::new_transfer_id();
+        let release_key = common::update::new_release_key();
+        let crypto = Crypto::from_base64(&release_key, "release")?;
+        let staging = self.transports.values().next()
+            .context("no agents enrolled")?;
+        let (chunks, total_bytes, sha256) =
+            match common::update::stage_release(staging, &release, &crypto, &source).await {
+                Ok(staged) => staged,
+                Err(error) => {
+                    let _ = staging.delete_release(&release).await;
+                    return Err(error);
+                }
+            };
+
+        let published_at = common::protocol::now_unix();
+        let mut results = Vec::new();
+        let mut delivered = 0usize;
+        for agent in &agents {
+            let transport = self.transport_for(agent)?;
+            let heartbeat = transport.read_heartbeat(agent).await.ok().flatten();
+            let manifest = common::UpdateManifest {
+                agent_id: agent.clone(),
+                version: version.clone(),
+                target: target.clone(),
+                release: release.clone(),
+                chunks,
+                total_bytes,
+                sha256: sha256.clone(),
+                release_key_b64: release_key.clone(),
+                published_at,
+            };
+            let outcome = transport.put_update_manifest(&manifest).await;
+            let published = outcome.is_ok();
+            if published {
+                delivered += 1;
+            }
+            results.push(json!({
+                "agent_id": agent,
+                "published": published,
+                "error": outcome.err().map(|error| format!("{error:#}")),
+                "online": heartbeat.is_some(),
+                "running_version": heartbeat.as_ref().map(|hb| hb.agent_version.clone()),
+                // False here means the agent will refuse this release. Reported
+                // rather than blocked, because an agent that has never checked
+                // in has no known platform and is still worth publishing to.
+                "platform_matches": heartbeat.as_ref().map(|hb| hb.os == target),
+            }));
+        }
+
+        if delivered == 0 {
+            // Nothing can reach the chunks, so leave nothing behind.
+            let _ = staging.delete_release(&release).await;
+            anyhow::bail!("no agent could be given the update; the release was removed");
+        }
+
+        tracing::info!(
+            release = %release, %version, %target, agents = delivered, bytes = total_bytes,
+            "published update"
+        );
+        Ok(json!({
+            "release": release,
+            "version": version,
+            "target": target,
+            "sha256": sha256,
+            "bytes": total_bytes,
+            "chunks": chunks,
+            "published_at": published_at,
+            "agents": results,
+        }))
+    }
+
+    /// Resolve an optional agent list to a validated set, defaulting to all.
+    fn targets(&self, requested: Option<Vec<String>>) -> Result<Vec<String>> {
+        let mut agents = match requested {
+            Some(agents) => {
+                for agent in &agents {
+                    self.validate_agent(agent)?;
+                }
+                agents
+            }
+            None => self.allowed_agents.iter().cloned().collect(),
+        };
+        agents.sort();
+        agents.dedup();
+        if agents.is_empty() {
+            anyhow::bail!("no agents selected");
+        }
+        Ok(agents)
     }
 
     async fn push(&self, args: PushFileArgs) -> Result<serde_json::Value> {
@@ -527,6 +757,65 @@ impl Controller {
     }
 }
 
+/// Read `"{os} {arch}"` out of an executable header.
+///
+/// Publishing the wrong architecture is the easy mistake to make here — the
+/// binaries for every target come out of one CI run with similar names — and
+/// the agent's own check would catch it only after a round trip. The file
+/// already says what it is, so read it rather than trusting the caller.
+///
+/// Returns `None` for anything unrecognised, which asks the caller for an
+/// explicit target rather than guessing.
+async fn detect_target(path: &std::path::Path) -> Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut head = vec![0u8; 1024];
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .with_context(|| format!("open {}", path.display()))?;
+    let read = file.read(&mut head).await.context("read executable header")?;
+    head.truncate(read);
+    Ok(target_from_header(&head))
+}
+
+fn target_from_header(head: &[u8]) -> Option<String> {
+    // ELF: e_machine is a little-endian u16 at offset 18 on every target here.
+    // The OS is not reliably encoded (EI_OSABI reads as SysV on Linux), so ELF
+    // is treated as Linux, which is what an agent host actually is.
+    if head.len() >= 20 && head[..4] == [0x7f, b'E', b'L', b'F'] {
+        let arch = match u16::from_le_bytes([head[18], head[19]]) {
+            62 => "x86_64",
+            183 => "aarch64",
+            243 => "riscv64",
+            _ => return None,
+        };
+        return Some(format!("linux {arch}"));
+    }
+    // Mach-O, 64-bit little endian. cputype follows the magic.
+    if head.len() >= 8 && u32::from_le_bytes([head[0], head[1], head[2], head[3]]) == 0xfeed_facf {
+        let arch = match u32::from_le_bytes([head[4], head[5], head[6], head[7]]) {
+            0x0100_000c => "aarch64",
+            0x0100_0007 => "x86_64",
+            _ => return None,
+        };
+        return Some(format!("macos {arch}"));
+    }
+    // PE: the COFF machine field sits just past the signature, which the DOS
+    // stub points at from offset 0x3c.
+    if head.len() >= 0x40 && &head[..2] == b"MZ" {
+        let offset = u32::from_le_bytes([head[0x3c], head[0x3d], head[0x3e], head[0x3f]]) as usize;
+        if head.len() >= offset + 6 && &head[offset..offset + 4] == b"PE\0\0" {
+            let arch = match u16::from_le_bytes([head[offset + 4], head[offset + 5]]) {
+                0x8664 => "x86_64",
+                0xaa64 => "aarch64",
+                _ => return None,
+            };
+            return Some(format!("windows {arch}"));
+        }
+    }
+    None
+}
+
 /// Action name for the audit log. Never includes payload data.
 fn action_of(kind: &CommandKind) -> &'static str {
     match kind {
@@ -691,4 +980,50 @@ fn bounded_env(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
         anyhow::bail!("{name} must be in {min}..={max}");
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elf(machine: u16) -> Vec<u8> {
+        let mut head = vec![0u8; 64];
+        head[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        head[18..20].copy_from_slice(&machine.to_le_bytes());
+        head
+    }
+
+    #[test]
+    fn reads_the_architecture_out_of_an_elf_header() {
+        assert_eq!(target_from_header(&elf(62)).as_deref(), Some("linux x86_64"));
+        assert_eq!(target_from_header(&elf(183)).as_deref(), Some("linux aarch64"));
+        // The string has to match what the agent reports, or every agent would
+        // refuse the release it was just given.
+        assert_eq!(target_from_header(&elf(62)).as_deref(), Some("linux x86_64"));
+    }
+
+    #[test]
+    fn reads_mach_o_and_pe_headers() {
+        let mut macho = vec![0u8; 64];
+        macho[..4].copy_from_slice(&0xfeed_facfu32.to_le_bytes());
+        macho[4..8].copy_from_slice(&0x0100_000cu32.to_le_bytes());
+        assert_eq!(target_from_header(&macho).as_deref(), Some("macos aarch64"));
+
+        let mut pe = vec![0u8; 128];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&64u32.to_le_bytes());
+        pe[64..68].copy_from_slice(b"PE\0\0");
+        pe[68..70].copy_from_slice(&0x8664u16.to_le_bytes());
+        assert_eq!(target_from_header(&pe).as_deref(), Some("windows x86_64"));
+    }
+
+    #[test]
+    fn refuses_to_guess_at_anything_else() {
+        // A shell script, a truncated file, and an unknown machine all have to
+        // ask for an explicit target rather than publish under a wrong one.
+        assert_eq!(target_from_header(b"#!/bin/sh\necho hi\n"), None);
+        assert_eq!(target_from_header(&[0x7f, b'E', b'L', b'F']), None);
+        assert_eq!(target_from_header(&elf(0x9999)), None);
+        assert_eq!(target_from_header(&[]), None);
+    }
 }
