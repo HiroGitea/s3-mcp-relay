@@ -1,6 +1,6 @@
 ---
 name: relay-ops
-description: Operating remote machines through the S3 relay - choosing between exec and start_job, moving files without blowing up the context, and reading the failure modes correctly. Load when working with s3-relay MCP tools (list_agents, exec, push_file, start_job) or when a relay command times out.
+description: Operating remote machines through the S3 relay - choosing between exec and start_job, moving files without blowing up the context, installing packages onto a host with no internet, and reading the failure modes correctly. Load when working with s3-relay MCP tools (list_agents, exec, push_file, start_job, publish_update), when a relay command times out, or when a download, pip install, apt-get or git clone fails on the agent.
 ---
 
 # Operating the S3 relay
@@ -45,6 +45,34 @@ Use it for anything above a few tens of kilobytes, and always for binaries.
 
 Same split in the other direction: `write_file` for a config file, `push_file`
 for a wheel, a dataset, an installer.
+
+## The agent has no internet — you are its package manager
+
+The whole premise is a machine with no route out except the bucket. So anything
+that reaches for the network **on the agent** fails, and it fails in ways that
+read like something else: `pip install` hanging then timing out, `apt-get`
+reporting a DNS failure, `curl` refusing to connect, a build dying on a missing
+header, `git clone` never returning.
+
+Do not debug those as network problems on the agent, and do not retry them. The
+fix is the same every time: **fetch it where you have internet, then send it
+through the bucket.**
+
+1. Download or build the artifact on the controller machine — the one running
+   this MCP server, which does have a network.
+2. `push_file` it to the agent. It streams through S3, so size is not a concern
+   and nothing enters the conversation.
+3. Install from the local copy: `pip install /tmp/pkg.whl`, `apt-get install
+   ./pkg.deb`, `tar -xf`, and so on.
+
+For Python this generalises well: `pip download -r requirements.txt -d wheels/`
+on the controller (add `--platform`/`--only-binary=:all:` when the agent's
+architecture differs), push the directory contents, then
+`pip install --no-index --find-links /tmp/wheels -r requirements.txt` on the
+agent. The `--no-index` is what stops pip reaching for PyPI again.
+
+If the missing piece is the agent binary itself, that is a different tool:
+`publish_update` rolls a new `relay-agent` out to the whole fleet at once.
 
 ## Long jobs: nobody will tell you when it finishes
 

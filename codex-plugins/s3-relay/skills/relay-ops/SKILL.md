@@ -1,6 +1,6 @@
 ---
 name: relay-ops
-description: Operate remote machines through the S3 relay, including choosing between exec and start_job, moving files without consuming model context, and interpreting relay timeouts. Use with s3-relay MCP tools or when a relay command times out.
+description: Operate remote machines through the S3 relay, including choosing between exec and start_job, moving files without consuming model context, installing packages onto a host with no internet access, and interpreting relay timeouts. Use with s3-relay MCP tools, when a relay command times out, or when a download, pip install, apt-get or git clone fails on the agent.
 ---
 
 # Operating the S3 relay
@@ -27,6 +27,32 @@ Use `read_file` and `write_file` only for small text files. Their contents pass
 through model context. Use `pull_file` and `push_file` for binaries or anything
 larger than a few tens of kilobytes; they stream through the bucket and return
 only paths and checksums.
+
+## Install onto a host with no internet
+
+The agent's only route off the machine is the bucket, so any command that
+reaches for the network fails there: `pip install` times out, `apt-get` reports
+a DNS failure, `curl` cannot connect, `git clone` never returns. These are not
+network faults to debug on the agent, and retrying them does not help.
+
+Move the bytes through the relay instead:
+
+1. Download or build the artifact on the controller machine, which has a
+   network.
+2. `push_file` it to the agent; it streams through the bucket, so size is not a
+   concern and nothing enters model context.
+3. Install from the local copy — `pip install /tmp/pkg.whl`, `apt-get install
+   ./pkg.deb`, `tar -xf`.
+
+For Python dependencies, run `pip download -r requirements.txt -d wheels/` on
+the controller, adding `--platform` and `--only-binary=:all:` when the agent's
+architecture differs, push the wheels, and install with `pip install --no-index
+--find-links /tmp/wheels -r requirements.txt`. `--no-index` prevents pip from
+contacting PyPI again.
+
+When the outdated component is the agent binary itself, use `publish_update`
+rather than pushing it by hand; it delivers to the whole fleet at once and each
+agent verifies and restarts on its own.
 
 ## Handle long jobs
 
