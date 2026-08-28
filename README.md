@@ -285,7 +285,10 @@ their owner. The process warns when a secret-bearing file is more permissive
 than `0600`. Unknown keys are rejected to prevent misspelled security settings
 from silently changing policy.
 
-See [`relay.toml.example`](relay.toml.example).
+Every setting is available through either source. See
+[`relay.toml.example`](relay.toml.example) for the file form, and
+[`deploy/relay.env.example`](deploy/relay.env.example) for the same settings as
+environment variables — the shape a systemd `EnvironmentFile` wants.
 
 ## Plugins
 
@@ -427,7 +430,7 @@ property cannot be provided by client-side code alone.
 crates/common       protocol, crypto, config, S3 transport, transfer
 crates/controller   MCP stdio server (s3-relay-mcp)
 crates/agent        agent for the isolated server (relay-agent)
-deploy/             install scripts, IAM examples, systemd unit
+deploy/             install scripts, IAM examples, systemd unit, env template
 plugin/             Claude Code plugin
 codex-plugins/      Codex plugins
 ```
