@@ -198,6 +198,14 @@ struct PublishUpdateArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct StandDownArgs {
+    agent_id: String,
+    /// The `instance` to stop, as reported by list_agents. Identifies one
+    /// running process, not a machine.
+    instance: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RetractUpdateArgs {
     /// Agents to withdraw the offer from. Omit for all of them.
     agents: Option<Vec<String>>,
@@ -347,6 +355,18 @@ impl Controller {
         match self.pull(args).await {
             Ok(value) => self.json_result(&value),
             Err(error) => Ok(tool_error(format!("pull failed: {error:#}"))),
+        }
+    }
+
+    #[tool(description = "Stop one specific agent process when two are sharing an identity — normally two machines cloned from one disk image. Both suspend themselves on detecting the collision and one yields automatically; use this to choose which machine keeps working instead. Take the instance id from list_agents. The other side resumes once this one is gone.")]
+    async fn stand_down(&self, Parameters(args): Parameters<StandDownArgs>) -> Result<CallToolResult, McpError> {
+        if args.instance.trim().is_empty() {
+            return Ok(tool_error("instance must name the process to stop"));
+        }
+        match self.relay_instance(args.agent_id, args.instance, CommandKind::StandDown, 30).await {
+            Ok(response) if response.ok => self.json_result(&json!({ "stood_down": true })),
+            Ok(response) => Ok(response_error(response)),
+            Err(error) => Ok(tool_error(format!("stand down failed: {error:#}"))),
         }
     }
 
@@ -678,6 +698,36 @@ impl Controller {
         self.relay_with(agent_id, kind, capped, self.max_wait_secs).await
     }
 
+    /// Send a command only one agent process may act on.
+    ///
+    /// The other process leaves it in the bucket rather than consuming it, so
+    /// this reaches the intended one even though both are polling the same
+    /// mailbox — which is the only way to address a duplicate at all.
+    async fn relay_instance(
+        &self,
+        agent_id: String,
+        instance: String,
+        kind: CommandKind,
+        timeout_secs: u64,
+    ) -> Result<Response> {
+        self.validate_agent(&agent_id)?;
+        let transport = self.transport_for(&agent_id)?;
+        let command = Command::new(agent_id, kind, timeout_secs, self.queue_ttl_secs)
+            .for_instance(instance);
+        tracing::info!(
+            agent = %command.agent_id, action = "stand_down", command_id = %command.id,
+            instance = %command.instance.as_deref().unwrap_or(""), "dispatch"
+        );
+        transport.send_command(&command).await?;
+        let wait = Duration::from_secs(
+            self.queue_ttl_secs.saturating_add(timeout_secs).saturating_add(10).min(self.max_wait_secs),
+        );
+        transport
+            .await_response(&command, wait, self.poll_interval)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("timed out; that instance may already be gone"))
+    }
+
     /// `wait_cap_secs` bounds how long the controller blocks on the response.
     /// Commands and transfers use very different values, so it is explicit.
     async fn relay_with(
@@ -971,6 +1021,7 @@ fn action_of(kind: &CommandKind) -> &'static str {
         CommandKind::ListJobs => "list_jobs",
         CommandKind::JobOutput { .. } => "job_output",
         CommandKind::CancelJob { .. } => "cancel_job",
+        CommandKind::StandDown => "stand_down",
     }
 }
 

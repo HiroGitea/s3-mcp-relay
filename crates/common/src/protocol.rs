@@ -16,6 +16,15 @@ pub struct Command {
     /// Latest time at which the agent may begin this command.
     pub expires_at: i64,
     pub timeout_secs: u64,
+    /// Restrict this command to one running agent process.
+    ///
+    /// Only meaningful when two agents share an identity — from a cloned disk
+    /// image, normally. They poll the same mailbox, so an ordinary command
+    /// cannot be aimed at one of them; this can. An agent leaves a command
+    /// addressed to a different instance where it found it, rather than
+    /// consuming it, so the intended one still receives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
     pub kind: CommandKind,
 }
 
@@ -34,8 +43,15 @@ impl Command {
             created_at,
             expires_at: created_at.saturating_add(queue_ttl_secs.min(i64::MAX as u64) as i64),
             timeout_secs,
+            instance: None,
             kind,
         }
+    }
+
+    /// Address this command to one specific agent process.
+    pub fn for_instance(mut self, instance: impl Into<String>) -> Self {
+        self.instance = Some(instance.into());
+        self
     }
 
     pub fn validate_for_agent(&self, expected_agent: &str, max_timeout_secs: u64) -> Result<()> {
@@ -168,6 +184,13 @@ pub enum CommandKind {
         from: String,
         to: String,
     },
+    /// Stop consuming commands, permanently, until this process is restarted.
+    ///
+    /// The manual half of collision handling: when two agents share an
+    /// identity they both suspend themselves and one yields automatically, but
+    /// the automatic rule cannot know which machine you would rather keep. Send
+    /// this to the instance you want to stand down and the other resumes.
+    StandDown,
     /// Stage a remote file in the bucket for the controller to collect.
     PullBlob {
         transfer: String,
@@ -328,6 +351,25 @@ pub struct Heartbeat {
     /// predate the field, which falls the comparison back to the version.
     #[serde(default)]
     pub binary_sha256: Option<String>,
+    /// Identifies this *process*, not this machine: a fresh random value on
+    /// every start, held only in memory.
+    ///
+    /// Never persisted, and that is the entire point. Two machines cloned from
+    /// one disk image share an agent id, a keypair and every file on disk —
+    /// anything written down would be copied along with them. A value minted at
+    /// startup is the one thing that cannot be, so it is what makes a duplicate
+    /// visible.
+    #[serde(default)]
+    pub instance: String,
+    /// Set when another process was seen holding this same identity, naming its
+    /// instance. Both sides report it, so one `list_agents` names both.
+    #[serde(default)]
+    pub conflict_with: Option<String>,
+    /// Whether this process has stopped taking commands — either because it
+    /// yielded to the other side of a collision, or because it was told to
+    /// stand down.
+    #[serde(default)]
+    pub suspended: bool,
     pub at: i64,
     pub ttl_secs: i64,
     /// Problems the agent hit outside of any single command, newest last.
@@ -426,6 +468,10 @@ pub enum EventKind {
     /// because the agent was busy. The only channel that reports this: an
     /// update is not a command, so there is no `Response` to carry it home.
     Update,
+    /// Another process is using this agent's identity. Reported rather than
+    /// worked around, because the damage is silent: commands meant for one
+    /// machine run on another, or on both.
+    Collision,
 }
 
 impl Heartbeat {

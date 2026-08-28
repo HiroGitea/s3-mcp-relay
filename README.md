@@ -179,6 +179,7 @@ Restart the MCP client and invoke `list_agents`.
 | `push_file` · `pull_file` | Any size, streamed through the bucket |
 | `list_dir` · `make_dir` · `remove` · `move_path` | Path management |
 | `publish_update` · `update_status` · `retract_update` | Roll a new agent binary out to the fleet |
+| `stand_down` | Stop one process when two agents share an identity |
 
 ### Tool selection
 
@@ -405,6 +406,43 @@ not match the platform its name claims is refused rather than published, and
 that a version already rolled out is not uploaded again — the ledger outlives
 the release in the bucket, so a completed-and-swept rollout is not restarted
 from scratch. Each agent still applies all five of its own checks on top.
+
+## Two agents on one identity
+
+Cloning a machine clones its agent identity, and the result is worse than one
+of them losing: both poll the same mailbox, fetch-then-delete is not atomic, so
+a command meant for one host can run on the other — or on both. Responses
+overwrite each other, heartbeats flap between two machines, and shipped logs
+interleave at the same offsets.
+
+Each agent process therefore mints a random **instance** id at startup and puts
+it in its heartbeat. It is never written to disk, which is the point: a cloned
+image carries every file, so only a value created at run time can tell two
+copies apart. Before writing its heartbeat an agent reads the current one, and
+a fresh heartbeat carrying somebody else's instance means a duplicate exists.
+
+Both sides then suspend command execution, and one yields automatically: the
+higher instance id stands down. Plain string comparison, evaluated
+independently, because S3 offers no atomic compare-and-swap to build a lease on
+and not every S3-compatible store implements conditional writes. The collision
+is reported in `list_agents` with both instance ids, and the suspended side
+declines commands with an explanation rather than letting them time out.
+
+To choose which machine keeps working instead of accepting the automatic
+verdict:
+
+```text
+stand_down(agent_id="gpu-01", instance="<the one to stop>")
+```
+
+A command carrying an `instance` is left in the bucket by every other process,
+so it reaches the intended one even though both are reading the same prefix.
+Standing down is permanent for that process — a heartbeat timing out will not
+quietly return a machine you retired to service.
+
+The way to avoid all of this is to not clone an identity: delete
+`~/.config/relay/agent.toml` before saving a disk image, and let each instance
+run `relay-agent init` for itself.
 
 ## Storage requirements
 

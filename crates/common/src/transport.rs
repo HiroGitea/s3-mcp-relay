@@ -255,16 +255,39 @@ impl Transport {
         }
     }
 
-    pub async fn drain_commands(&self, agent: &str) -> Result<Vec<Command>> {
+    /// Claim every command waiting for this agent that this process may run.
+    ///
+    /// Still at-most-once for anything it returns: the object is deleted before
+    /// the command reaches the caller, so a crash loses the command rather than
+    /// repeating its side effects.
+    ///
+    /// A command addressed to a *different* instance is deliberately left in
+    /// the bucket instead. Two agents sharing an identity poll the same prefix,
+    /// and consuming each other's mail is exactly what makes a collision hard
+    /// to recover from — the message aimed at one of them would be eaten by the
+    /// other and never arrive.
+    pub async fn drain_commands(&self, agent: &str, instance: &str) -> Result<Vec<Command>> {
         validate_agent_id(agent)?;
         let keys = self.list_keys(&self.cmd_prefix(agent)).await?;
         let mut commands = Vec::with_capacity(keys.len());
         for key in keys {
-            match self.take_encrypted::<Command>(&key).await {
-                Ok(Some(command)) => commands.push(command),
-                Ok(None) => {}
-                Err(error) => tracing::warn!(%key, %error, "discarded invalid relay command"),
+            let Some(bytes) = self.get_raw(&key, MAX_RELAY_OBJECT_BYTES).await? else { continue };
+            let command: Command = match self.crypto.open(&key, &bytes) {
+                Ok(command) => command,
+                Err(error) => {
+                    // Deleted, not retried: an object this agent cannot open is
+                    // one it will never be able to open, and leaving it would
+                    // mean re-fetching it on every poll forever.
+                    tracing::warn!(%key, %error, "discarded invalid relay command");
+                    let _ = self.delete_key(&key).await;
+                    continue;
+                }
+            };
+            if command.instance.as_deref().is_some_and(|target| target != instance) {
+                continue;
             }
+            self.delete_key(&key).await?;
+            commands.push(command);
         }
         commands.sort_by_key(|command| command.created_at);
         Ok(commands)

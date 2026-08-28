@@ -258,6 +258,9 @@ async fn run(
             hostname: hostname(), os: os_string(),
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
         })),
+        // Handled by the command loop, which owns the suspension state; it
+        // never reaches the executor.
+        CommandKind::StandDown => Ok(Response::ok(cmd, ResponsePayload::Empty)),
         CommandKind::Exec { program, args, cwd, stdin_b64 } => {
             exec(cmd, policy, program, args, cwd.as_deref(), stdin_b64.as_deref()).await
         }
