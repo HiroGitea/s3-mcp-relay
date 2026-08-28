@@ -49,9 +49,19 @@ impl LogShipper {
     }
 }
 
+/// Suffix of the sidecar file that records how much of a log has been shipped.
+/// Named once because [`marker_path`] creates these files and [`safe_source`]
+/// has to refuse them; the two disagreeing is what caused the loop below.
+const MARKER_SUFFIX: &str = ".shipped";
+
+/// Longest source name the transport accepts. Checked here as well so an
+/// over-long name is skipped quietly instead of being retried forever against
+/// a limit this side never sees.
+const MAX_SOURCE_BYTES: usize = 96;
+
 fn marker_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
-    value.push(".shipped");
+    value.push(MARKER_SUFFIX);
     PathBuf::from(value)
 }
 
@@ -62,8 +72,58 @@ fn read_marker(path: &Path) -> u64 {
 
 fn safe_source(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?.to_owned();
+    // Markers sit beside the logs they track and are named after them, so
+    // `agent.log.<date>.shipped` still matches the agent-log prefix below.
+    // Shipping one writes a marker for the marker, and every pass appends
+    // another suffix — until the name passes 96 bytes, the transport rejects
+    // it, and the agent retries the same doomed upload once a second forever,
+    // writing a warning each time into the very log it is trying to ship.
+    if name.ends_with(MARKER_SUFFIX) {
+        return None;
+    }
     let job_log = matches!(path.extension().and_then(|v| v.to_str()), Some("out" | "err"));
     let agent_log = name.starts_with("agent.log.");
-    ((job_log || agent_log) && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')))
+    ((job_log || agent_log)
+        && name.len() <= MAX_SOURCE_BYTES
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')))
         .then_some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ships_job_output_and_the_agent_log() {
+        assert_eq!(safe_source(Path::new("/jobs/abc.out")).as_deref(), Some("abc.out"));
+        assert_eq!(safe_source(Path::new("/jobs/abc.err")).as_deref(), Some("abc.err"));
+        assert_eq!(
+            safe_source(Path::new("/jobs/agent.log.2026-08-28")).as_deref(),
+            Some("agent.log.2026-08-28")
+        );
+    }
+
+    #[test]
+    fn never_ships_its_own_offset_markers() {
+        // The regression: each of these was shipped, producing the next one.
+        assert_eq!(safe_source(Path::new("/jobs/agent.log.2026-08-28.shipped")), None);
+        assert_eq!(safe_source(Path::new("/jobs/agent.log.2026-08-28.shipped.shipped")), None);
+        assert_eq!(safe_source(Path::new("/jobs/abc.out.shipped")), None);
+    }
+
+    #[test]
+    fn a_marker_is_named_so_that_it_is_refused() {
+        // Ties the two halves together: whatever marker_path produces for a
+        // shippable log must be something safe_source declines.
+        let log = Path::new("/jobs/agent.log.2026-08-28");
+        assert!(safe_source(log).is_some());
+        assert_eq!(safe_source(&marker_path(log)), None);
+    }
+
+    #[test]
+    fn skips_names_the_transport_would_reject() {
+        let long = format!("agent.log.{}", "x".repeat(MAX_SOURCE_BYTES));
+        assert_eq!(safe_source(Path::new(&long)), None);
+        assert_eq!(safe_source(Path::new("/jobs/weird name.out")), None);
+    }
 }
