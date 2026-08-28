@@ -49,8 +49,12 @@ impl Registry {
     pub fn agents(&self) -> Result<Vec<AgentKey>> {
         let conn = Connection::open(&self.path)?;
         let mut stmt = conn.prepare("SELECT id,public_key FROM agents ORDER BY id")?;
-        Ok(stmt.query_map([], |row| Ok(AgentKey { id: row.get(0)?, public_key: row.get(1)? }))?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        // Collected into a local first: returning the expression directly would
+        // keep the row iterator borrowing `stmt` past the end of the function.
+        let agents = stmt
+            .query_map([], |row| Ok(AgentKey { id: row.get(0)?, public_key: row.get(1)? }))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(agents)
     }
 
     pub fn event(&self, agent: &str, at: i64, kind: &str, message: &str) -> Result<()> {
