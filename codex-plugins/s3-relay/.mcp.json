@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "s3-relay": {
+      "command": "${RELAY_MCP_BIN}",
+      "env": {
+        "RELAY_CONFIG": "${RELAY_CONFIG}",
+        "RELAY_LOG_FILE": "${RELAY_LOG_FILE}"
+      }
+    }
+  }
+}

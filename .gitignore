@@ -1,0 +1,9 @@
+/target/
+.env
+relay.toml
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.update
+.DS_Store

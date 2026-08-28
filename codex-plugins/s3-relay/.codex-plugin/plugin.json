@@ -1,0 +1,26 @@
+{
+  "name": "s3-relay",
+  "version": "0.1.0",
+  "description": "Operate isolated remote agents through an encrypted S3 relay.",
+  "author": {
+    "name": "S3 Relay contributors"
+  },
+  "license": "MIT",
+  "keywords": ["mcp", "remote-agent", "s3", "operations"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "S3 Relay",
+    "shortDescription": "Encrypted remote agent operations",
+    "longDescription": "Manage paired remote agents, detached jobs, centralized logs, and file transfers through an encrypted S3-compatible relay.",
+    "developerName": "S3 Relay contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": [
+      "Show relay agent health and recent errors.",
+      "Run a safe detached job on a paired agent.",
+      "Inspect centralized logs for a relay job."
+    ],
+    "brandColor": "#1F6F5C"
+  }
+}

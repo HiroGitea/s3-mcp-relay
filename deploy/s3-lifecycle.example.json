@@ -1,0 +1,11 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-relay-safety-net",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "REPLACE_PREFIX/" },
+      "Expiration": { "Days": 1 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+    }
+  ]
+}

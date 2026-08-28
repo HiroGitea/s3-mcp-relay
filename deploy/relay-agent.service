@@ -1,0 +1,23 @@
+[Unit]
+Description=S3 MCP Relay Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=s3-relay
+Group=s3-relay
+EnvironmentFile=/etc/s3-relay/agent.env
+ExecStart=/usr/local/bin/relay-agent
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Add only the directories declared in AGENT_ALLOWED_ROOTS.
+ReadWritePaths=/srv/legacy-app
+
+[Install]
+WantedBy=multi-user.target
+

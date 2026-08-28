@@ -1,0 +1,47 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListOnlyRelayMailbox",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::REPLACE_BUCKET",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "REPLACE_PREFIX/agents/*",
+            "REPLACE_PREFIX/resp/REPLACE_AGENT/*",
+            "REPLACE_PREFIX/blob/REPLACE_AGENT/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "SendCommands",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/cmd/REPLACE_AGENT/*"
+    },
+    {
+      "Sid": "TransferChunks",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/blob/REPLACE_AGENT/*"
+    },
+    {
+      "Sid": "RingDoorbell",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/doorbell/REPLACE_AGENT.json"
+    },
+    {
+      "Sid": "ConsumeResponsesAndInspectHeartbeats",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:DeleteObject"],
+      "Resource": [
+        "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/resp/REPLACE_AGENT/*",
+        "arn:aws:s3:::REPLACE_BUCKET/REPLACE_PREFIX/agents/*"
+      ]
+    }
+  ]
+}

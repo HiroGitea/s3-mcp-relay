@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "s3-relay": {
+      "command": "C:\\path\\to\\s3-relay-mcp.exe",
+      "env": {
+        "S3_ENDPOINT": "https://s3.example.internal",
+        "S3_REGION": "us-east-1",
+        "S3_BUCKET": "legacy-control-relay",
+        "S3_PREFIX": "relay-prod/",
+        "S3_ACCESS_KEY_ID": "CONTROLLER_ACCESS_KEY",
+        "S3_SECRET_ACCESS_KEY": "CONTROLLER_SECRET_KEY",
+        "S3_FORCE_PATH_STYLE": "true",
+        "RELAY_SHARED_KEY": "BASE64_32_BYTE_SHARED_KEY",
+        "RELAY_KEY_ID": "primary",
+        "CONTROL_ALLOWED_AGENTS": "legacy-01"
+      }
+    }
+  }
+}
+

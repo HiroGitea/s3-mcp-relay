@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/controller",
+    "crates/agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["31057166+HiroGitea@users.noreply.github.com"]
+rust-version = "1.94.1"
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+time = { version = "0.3", features = ["formatting", "macros"] }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+toml = "0.8"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tracing-appender = "0.2"
+
+# S3-compatible object storage (MinIO / Ceph / Backblaze / R2 / AWS all work
+# via a custom endpoint + path-style addressing).
+aws-sdk-s3 = "=1.144.0"
+
+# Official Model Context Protocol SDK. stdio keeps the controller local to
+# Claude and does not open another listening network port.
+rmcp = { version = "=3.0.1", features = ["server", "macros", "schemars", "transport-io"] }
+
+common = { path = "crates/common" }
