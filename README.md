@@ -364,6 +364,45 @@ this is worth thinking about: an agent that can rewrite its own executable can
 run anything as its service user after a restart, which is a real widening of
 what the sandbox is otherwise holding back.
 
+### Retiring a finished rollout
+
+Once every agent that still matters is running the published build, the
+controller deletes the release and its manifests from the bucket on its own.
+Publishing again starts the next cycle.
+
+"Every agent that still matters" is the hard part, because a heartbeat only
+exists while an agent is alive — the bucket cannot tell a machine that is
+rebooting from one that was decommissioned last spring. The controller
+remembers when each agent was last heard from, and anything silent for longer
+than `controller.update_seen_days` (default 3) is treated as gone: it does not
+hold the rollout open, and its manifest is removed with the rest. A machine off
+for longer than that comes back to no manifest and stays on its old binary
+until something is published again, so raise the window if your fleet has
+machines that sleep for weeks.
+
+Completion is decided by hash, not version string. Agents report the SHA-256 of
+the binary they are running, so a rebuilt `0.1.0` is not mistaken for the one it
+replaced.
+
+### Unattended releases
+
+Point the controller at a repository and the whole cycle runs without anyone
+asking for it — a release is tagged, agents install it, the sweep removes it,
+the next tag begins again:
+
+```toml
+[controller]
+auto_publish_repo = "HiroGitea/s3-mcp-relay"
+```
+
+This is off unless configured, and deliberately so: it downloads binaries from
+the internet and hands them to every machine you own. What it does check is that
+only platforms agents actually run are fetched, that an asset whose header does
+not match the platform its name claims is refused rather than published, and
+that a version already rolled out is not uploaded again — the ledger outlives
+the release in the bucket, so a completed-and-swept rollout is not restarted
+from scratch. Each agent still applies all five of its own checks on top.
+
 ## Storage requirements
 
 Ephemeral transport depends on the following bucket configuration:

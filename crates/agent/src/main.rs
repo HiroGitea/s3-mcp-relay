@@ -108,6 +108,24 @@ async fn main() -> Result<()> {
         optional_env("AGENT_GPU_METRICS")
             .map_or(true, |value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no")),
     );
+    // Sampled once: the file cannot change under a running process without
+    // something having replaced it, and that path ends in a restart anyway.
+    // Reported so the controller can tell "installed my release" apart from
+    // "happens to carry the same version string".
+    let binary_sha256 = match std::env::current_exe() {
+        Ok(path) => match update::file_sha256(&path).await {
+            Ok(sha256) => Some(sha256),
+            Err(error) => {
+                warn!(%error, "could not hash the running binary");
+                None
+            }
+        },
+        Err(error) => {
+            warn!(%error, "could not locate the running binary");
+            None
+        }
+    };
+
     let heartbeat = tokio::spawn(heartbeat_loop(
         transport.clone(),
         agent_id.clone(),
@@ -116,6 +134,7 @@ async fn main() -> Result<()> {
         log.clone(),
         job_manager.clone(),
         collector,
+        binary_sha256,
     ));
 
     // One slot is enough: the update task sends exactly once and then stops.
@@ -251,6 +270,7 @@ async fn update_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn heartbeat_loop(
     transport: Transport,
     agent_id: String,
@@ -259,6 +279,7 @@ async fn heartbeat_loop(
     log: EventLog,
     jobs: JobManager,
     collector: metrics::Collector,
+    binary_sha256: Option<String>,
 ) {
     loop {
         let sampled = collector.sample().await;
@@ -267,6 +288,7 @@ async fn heartbeat_loop(
             hostname: executor::hostname(),
             os: executor::os_string(),
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+            binary_sha256: binary_sha256.clone(),
             at: now_unix(),
             ttl_secs,
             recent_errors: log.snapshot(),

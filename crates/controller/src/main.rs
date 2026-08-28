@@ -1,6 +1,7 @@
 mod admin;
 mod log_store;
 mod registry;
+mod rollout;
 mod status_cache;
 
 use std::collections::{HashMap, HashSet};
@@ -38,6 +39,9 @@ use serde_json::json;
 struct Controller {
     transports: Arc<HashMap<String, Transport>>,
     allowed_agents: HashSet<String>,
+    /// Also the rollout ledger: which builds have been published, and when each
+    /// agent was last heard from.
+    registry: registry::Registry,
     queue_ttl_secs: u64,
     max_exec_secs: u64,
     max_wait_secs: u64,
@@ -510,6 +514,17 @@ impl Controller {
             anyhow::bail!("no agent could be given the update; the release was removed");
         }
 
+        // Recorded before anyone installs anything, and kept after the release
+        // is swept out of the bucket. Automatic publishing consults this to
+        // avoid re-uploading a build whose rollout already finished.
+        self.registry.record_rollout(&registry::Rollout {
+            release: release.clone(),
+            version: version.clone(),
+            target: target.clone(),
+            sha256: sha256.clone(),
+            published_at,
+        })?;
+
         tracing::info!(
             release = %release, %version, %target, agents = delivered, bytes = total_bytes,
             "published update"
@@ -757,6 +772,125 @@ impl Controller {
     }
 }
 
+/// Retire releases every agent that still matters has installed.
+///
+/// A rollout that has reached everyone is dead weight in the bucket, and the
+/// manifests keep every agent doing a GET they no longer need. Sweeping runs on
+/// its own schedule rather than at publish time, because "everyone has it" is
+/// something that only becomes true minutes or hours later.
+async fn cleanup_loop(controller: Controller, policy: rollout::Policy, every: Duration) {
+    loop {
+        tokio::time::sleep(every).await;
+        match rollout::sweep(&controller.transports, &controller.registry, &policy).await {
+            Ok(swept) if swept.manifests_removed > 0 => tracing::info!(
+                releases = swept.releases_removed.len(),
+                manifests = swept.manifests_removed,
+                "swept completed rollouts"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "rollout sweep failed"),
+        }
+    }
+}
+
+/// Watch a GitHub repository and publish each new release to the fleet.
+///
+/// Off unless a repository is configured. It downloads binaries from the
+/// internet and hands them to every machine, so it is not something to switch
+/// on by default — but with it on, the whole cycle runs unattended: a release
+/// is published, agents install it, the sweep removes it, and the next tag
+/// starts the cycle again.
+async fn auto_publish_loop(
+    controller: Controller,
+    repo: String,
+    every: Duration,
+    seen_window: Duration,
+) {
+    loop {
+        if let Err(error) = check_for_release(&controller, &repo, seen_window).await {
+            tracing::warn!(%error, %repo, "automatic release check failed");
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+async fn check_for_release(
+    controller: &Controller,
+    repo: &str,
+    seen_window: Duration,
+) -> Result<()> {
+    let release = rollout::latest_release(repo).await?;
+    let cutoff = common::protocol::now_unix().saturating_sub(seen_window.as_secs() as i64);
+    let seen = controller.registry.seen_since(cutoff)?;
+
+    // Only build for platforms that agents actually run. Downloading an arm64
+    // binary for a fleet that has none would upload it to the bucket for
+    // nobody.
+    let mut by_target: HashMap<String, Vec<String>> = HashMap::new();
+    for agent in seen {
+        if !controller.allowed_agents.contains(&agent.id) {
+            continue;
+        }
+        if let Some(platform) = agent.platform {
+            by_target.entry(platform).or_default().push(agent.id);
+        }
+    }
+    if by_target.is_empty() {
+        tracing::debug!(%repo, "no agents seen recently; nothing to publish to");
+        return Ok(());
+    }
+
+    let staging = rollout::staging_dir();
+    for (target, agents) in by_target {
+        if controller.registry.already_published(&release.tag, &target)? {
+            continue;
+        }
+        let name = rollout::asset_name(&target);
+        let Some(asset) = release.assets.iter().find(|asset| asset.name == name) else {
+            tracing::debug!(%repo, tag = %release.tag, %target, asset = %name,
+                "release carries no asset for this platform");
+            continue;
+        };
+
+        tokio::fs::create_dir_all(&staging)
+            .await
+            .with_context(|| format!("create {}", staging.display()))?;
+        let downloaded = staging.join(&name);
+        rollout::download_asset(asset, &downloaded).await?;
+
+        // The asset name is a claim; the header is evidence. Publishing a
+        // mislabeled asset would send an aarch64 build to x86-64 machines,
+        // where every agent would refuse it and the rollout would never end.
+        let actual = detect_target(&downloaded).await?;
+        if actual.as_deref() != Some(target.as_str()) {
+            tracing::warn!(
+                %repo, tag = %release.tag, %target, asset = %name,
+                detected = actual.as_deref().unwrap_or("unrecognised"),
+                "release asset is not built for the platform its name claims; skipping"
+            );
+            let _ = tokio::fs::remove_file(&downloaded).await;
+            continue;
+        }
+
+        let published = controller
+            .publish(PublishUpdateArgs {
+                local_path: downloaded.to_string_lossy().into_owned(),
+                agents: Some(agents),
+                target: Some(target.clone()),
+                version: Some(release.tag.clone()),
+            })
+            .await;
+        let _ = tokio::fs::remove_file(&downloaded).await;
+        let published = published?;
+        tracing::info!(
+            %repo, tag = %release.tag, %target,
+            sha256 = published["sha256"].as_str().unwrap_or(""),
+            "published a new release automatically"
+        );
+    }
+    Ok(())
+}
+
 /// Read `"{os} {arch}"` out of an executable header.
 ///
 /// Publishing the wrong architecture is the easy mistake to make here — the
@@ -939,6 +1073,7 @@ async fn main() -> Result<()> {
     let controller = Controller {
         transports: transports.clone(),
         allowed_agents,
+        registry: registry.clone(),
         queue_ttl_secs: bounded_env("CONTROL_QUEUE_TTL_SECS", 120, 1, 3_600)?,
         max_exec_secs: bounded_env("CONTROL_MAX_EXEC_SECS", 300, 1, 3_600)?,
         max_wait_secs: bounded_env("CONTROL_MAX_WAIT_SECS", 430, 10, 7_200)?,
@@ -966,6 +1101,31 @@ async fn main() -> Result<()> {
             path,
             Duration::from_secs(status_interval),
         ));
+    }
+
+    // An agent silent for longer than this is treated as decommissioned: it
+    // stops holding a finished rollout open, and its platform stops counting
+    // toward which builds are worth fetching.
+    let seen_window = Duration::from_secs(
+        bounded_env("CONTROL_UPDATE_SEEN_DAYS", 3, 1, 365)?.saturating_mul(86_400),
+    );
+    let cleanup = optional_env("CONTROL_AUTO_CLEANUP")
+        .map_or(true, |value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"));
+    if cleanup {
+        tokio::spawn(cleanup_loop(
+            controller.clone(),
+            rollout::Policy { seen_window, cleanup },
+            Duration::from_secs(bounded_env("CONTROL_CLEANUP_CHECK_SECS", 300, 30, 86_400)?),
+        ));
+    }
+
+    // Deliberately opt-in: this downloads binaries from the internet and hands
+    // them to every machine in the fleet.
+    if let Some(repo) = optional_env("CONTROL_AUTO_PUBLISH_REPO") {
+        rollout::validate_repo(&repo)?;
+        let every = Duration::from_secs(bounded_env("CONTROL_AUTO_PUBLISH_CHECK_SECS", 3_600, 300, 604_800)?);
+        tracing::info!(%repo, interval_secs = every.as_secs(), "automatic release publishing enabled");
+        tokio::spawn(auto_publish_loop(controller.clone(), repo, every, seen_window));
     }
 
     let service = controller.serve(stdio()).await?;

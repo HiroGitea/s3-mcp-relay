@@ -53,6 +53,17 @@ async fn refresh(
             for event in &heartbeat.recent_errors {
                 registry.event(id, event.at, &format!("{:?}", event.kind), &event.message)?;
             }
+            // Remembered across restarts, because a heartbeat is deleted as soon
+            // as it goes stale and the bucket then cannot say whether a silent
+            // agent is rebooting or retired. That distinction is what decides
+            // when a finished release may be cleaned up.
+            registry.mark_seen(&crate::registry::SeenAgent {
+                id: id.clone(),
+                last_seen: heartbeat.at,
+                version: Some(heartbeat.agent_version.clone()),
+                binary_sha256: heartbeat.binary_sha256.clone(),
+                platform: Some(heartbeat.os.clone()),
+            })?;
             agents.push(AgentStatus {
                 id: heartbeat.agent_id,
                 hostname: heartbeat.hostname,

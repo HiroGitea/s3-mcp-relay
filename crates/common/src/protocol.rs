@@ -319,6 +319,15 @@ pub struct Heartbeat {
     pub hostname: String,
     pub os: String,
     pub agent_version: String,
+    /// SHA-256 of the binary this agent is running, sampled once at startup.
+    ///
+    /// The version string cannot answer "did this machine install the release
+    /// I published": a rebuilt `0.1.0` carries the same string as the one it
+    /// replaced. The hash is the same identity a published release is named by,
+    /// so comparing the two is exact. `None` from an agent old enough to
+    /// predate the field, which falls the comparison back to the version.
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
     pub at: i64,
     pub ttl_secs: i64,
     /// Problems the agent hit outside of any single command, newest last.

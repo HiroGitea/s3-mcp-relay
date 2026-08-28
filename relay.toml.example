@@ -64,6 +64,29 @@ public_key = "replace-with-controller-x25519-public-key"
 database = "/home/operator/.config/relay/controller.db"
 log_dir = "/home/operator/.local/state/relay/logs"
 
+# Delete a published release once every agent that still matters is running it.
+# Keeps the bucket clean and stops agents doing a GET for an update they already
+# have. Publishing a new build starts the cycle again.
+auto_cleanup       = true
+cleanup_check_secs = 300
+
+# An agent silent for longer than this is treated as decommissioned: it no
+# longer holds a finished rollout open, and its platform no longer counts when
+# deciding which builds are worth fetching. A machine off for longer than this
+# comes back to no manifest and stays on its old binary until something is
+# published again — raise it if your fleet has machines that sleep for weeks.
+update_seen_days = 3
+
+# Watch a GitHub repository and publish each new release to the fleet without
+# being asked. Left unset the feature is off, which is the right default: this
+# downloads binaries from the internet and hands them to every machine.
+#
+# Only platforms that agents actually run are fetched, an asset whose header
+# does not match the platform its name claims is refused, and every agent still
+# applies its own checks before installing.
+# auto_publish_repo       = "HiroGitea/s3-mcp-relay"
+# auto_publish_check_secs = 3600
+
 # ---------------------------------------------------------------------------
 # Agent side (the isolated server). Ignored by the controller.
 # ---------------------------------------------------------------------------
