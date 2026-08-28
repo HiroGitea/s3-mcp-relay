@@ -44,7 +44,14 @@ impl Policy {
         let roots = optional_env("AGENT_ALLOWED_ROOTS")
             .map(|value| {
                 let value = OsString::from(value);
-                std::env::split_paths(&value).collect::<Vec<_>>()
+                // Empty components are dropped, as they are for the program
+                // allowlist. `split_paths("")` yields one empty path, so an
+                // `allowed_roots = []` in the config file — which is exactly
+                // what `relay-agent init` writes — would otherwise fail to
+                // canonicalize and stop the agent from starting at all.
+                std::env::split_paths(&value)
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         let mut allowed_roots = Vec::with_capacity(roots.len());
@@ -599,3 +606,38 @@ pub fn hostname() -> String {
 /// the string the controller matches a release against and the string the agent
 /// checks it with cannot drift apart.
 pub fn os_string() -> String { common::update::current_target() }
+
+#[cfg(test)]
+mod root_parsing_tests {
+    use std::ffi::OsString;
+
+    /// The parsing `Policy::from_env` applies to `AGENT_ALLOWED_ROOTS`.
+    fn roots(value: &str) -> Vec<std::path::PathBuf> {
+        let value = OsString::from(value);
+        std::env::split_paths(&value)
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn an_empty_root_list_yields_no_roots() {
+        // `relay-agent init` writes `allowed_roots = []`, which reaches this
+        // as an empty string. Without the filter it becomes one empty path,
+        // canonicalize fails, and the agent refuses to start — from a config
+        // it generated itself.
+        assert!(roots("").is_empty());
+    }
+
+    #[test]
+    fn separators_around_real_entries_are_ignored() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let parsed = roots(&format!("{sep}/srv/app{sep}{sep}/var/log/app{sep}"));
+        assert_eq!(
+            parsed,
+            vec![
+                std::path::PathBuf::from("/srv/app"),
+                std::path::PathBuf::from("/var/log/app")
+            ]
+        );
+    }
+}
