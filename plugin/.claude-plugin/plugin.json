@@ -3,7 +3,7 @@
   "description": "Drive isolated Linux servers through an S3-compatible bucket: no inbound ports, no direct network path, end-to-end encrypted.",
   "version": "0.1.0",
   "author": {
-    "name": "Hiro",
+    "name": "S3 Relay contributors",
     "email": "31057166+HiroGitea@users.noreply.github.com"
   },
   "license": "MIT",

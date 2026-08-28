@@ -1,7 +1,7 @@
 {
   "name": "s3-mcp-relay",
   "owner": {
-    "name": "Hiro",
+    "name": "S3 Relay contributors",
     "url": "https://github.com/HiroGitea/s3-mcp-relay"
   },
   "metadata": {
@@ -15,7 +15,7 @@
       "description": "Drive isolated Linux servers through an S3-compatible bucket: no inbound ports, no direct network path, end-to-end encrypted. Registers the MCP server, adds operational guidance, and surfaces remote job state locally.",
       "version": "0.1.0",
       "author": {
-        "name": "Hiro"
+        "name": "S3 Relay contributors"
       },
       "license": "MIT",
       "keywords": ["mcp", "s3", "remote-execution", "air-gapped", "ops"]
