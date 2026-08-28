@@ -14,10 +14,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned to 22.04 rather than latest, because a glibc binary only runs
+          # on the version it was built against or newer. Building on 24.04
+          # (glibc 2.39) produces something that will not start on Ubuntu 22.04
+          # — which is what the machines this relay exists to reach actually
+          # run, and the failure arrives as an unhelpful "GLIBC_2.39 not found"
+          # at the moment of deployment. 2.35 covers 22.04 and everything after.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             label: linux-aarch64
           - os: macos-14
