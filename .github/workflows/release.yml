@@ -14,36 +14,121 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Pinned to 22.04 rather than latest, because a glibc binary only runs
-          # on the version it was built against or newer. Building on 24.04
-          # (glibc 2.39) produces something that will not start on Ubuntu 22.04
-          # — which is what the machines this relay exists to reach actually
-          # run, and the failure arrives as an unhelpful "GLIBC_2.39 not found"
-          # at the moment of deployment. 2.35 covers 22.04 and everything after.
+          # --- Linux, glibc ----------------------------------------------
+          #
+          # Pinned to 22.04 rather than latest, because a glibc binary runs on
+          # the version it was built against or newer and nothing older.
+          # Building on 24.04 (glibc 2.39) produces something that will not
+          # start on Ubuntu 22.04 — which is what the hosts this relay exists to
+          # reach actually run — and the failure arrives as an unhelpful
+          # "GLIBC_2.39 not found" at the moment of deployment, long after the
+          # build went green. 2.35 covers 22.04 and everything after it.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             label: linux-aarch64
+
+          # --- Linux, musl (static) --------------------------------------
+          #
+          # No libc floor at all: these run on Alpine, on distributions older
+          # than any runner offers, and inside scratch containers. The agent
+          # reports itself as "linux <arch> musl" so automatic updates fetch
+          # these rather than the glibc build.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            label: linux-x86_64-musl
+            musl: true
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            label: linux-aarch64-musl
+            musl: true
+
+          # 32-bit Linux. Tier 1, but the C crypto dependency is far less
+          # exercised there, so it is allowed to fail like the cross targets.
+          - os: ubuntu-22.04
+            target: i686-unknown-linux-gnu
+            label: linux-i686
+            multilib: true
+            optional: true
+
+          # --- macOS -----------------------------------------------------
           - os: macos-14
             target: aarch64-apple-darwin
             label: macos-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            label: macos-x86_64
+
+          # --- Windows ---------------------------------------------------
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: windows-x86_64
             ext: .exe
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            label: windows-aarch64
+            ext: .exe
+          # The GNU ABI build, for MinGW toolchains rather than MSVC.
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            label: windows-x86_64-gnu
+            ext: .exe
+            optional: true
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            label: windows-i686
+            ext: .exe
+            optional: true
+
+          # --- Cross-compiled, best effort -------------------------------
+          #
+          # No hosted runner exists for these, so they are built in Docker with
+          # `cross`. They are allowed to fail: the crypto dependency is C and
+          # does not support every architecture equally, and a mainframe target
+          # not building must not hold up a release for the platforms that do.
+          - os: ubuntu-22.04
+            target: s390x-unknown-linux-gnu
+            label: linux-s390x
+            cross: true
+            optional: true
+          - os: ubuntu-22.04
+            target: powerpc64le-unknown-linux-gnu
+            label: linux-ppc64le
+            cross: true
+            optional: true
+          - os: ubuntu-22.04
+            target: riscv64gc-unknown-linux-gnu
+            label: linux-riscv64
+            cross: true
+            optional: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional == true }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
+      - name: Install 32-bit toolchain
+        if: matrix.multilib
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib libc6-dev-i386
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
       - name: Build release binaries
         shell: bash
         env:
           RELAY_UPDATE_BASE_URL: https://github.com/${{ github.repository }}/releases/latest/download
-        run: cargo build --release --workspace --target "${{ matrix.target }}"
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --workspace --target "${{ matrix.target }}"
+          else
+            cargo build --release --workspace --target "${{ matrix.target }}"
+          fi
       - name: Stage assets
         shell: bash
         run: |
@@ -57,7 +142,10 @@ jobs:
             s3-relay-mcp-${{ matrix.label }}${{ matrix.ext }}
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
+    # always(), so one architecture failing to build does not withhold the
+    # release from every architecture that succeeded. The download step
+    # collects whatever artifacts exist.
+    if: always() && startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     steps:

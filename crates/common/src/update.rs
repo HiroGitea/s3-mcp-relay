@@ -62,10 +62,32 @@ pub const EXIT_UPDATED: i32 = 70;
 /// slow storage is not evidence of a bad build.
 const SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `"{os} {arch}"`. The single definition of what a build targets, shared by
-/// the heartbeat the controller reads and the check the agent makes.
+/// `"{os} {arch}"`, with ` musl` appended on a statically linked Linux build.
+///
+/// The single definition of what a build targets, shared by the heartbeat the
+/// controller reads and the check an agent makes before installing anything.
+///
+/// The libc qualifier matters because the two Linux builds are not
+/// interchangeable: a glibc binary will not start on Alpine, and the failure
+/// arrives as a missing loader rather than anything self-explanatory. Only musl
+/// is named — a plain `"linux x86_64"` continues to mean the glibc build it has
+/// always meant, so existing agents and manifests are unaffected.
 pub fn current_target() -> String {
-    format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
+    let libc = if cfg!(target_env = "musl") { " musl" } else { "" };
+    format!("{} {}{libc}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The `"{os} {arch}"` part of a target, dropping any libc qualifier.
+///
+/// An executable header says which OS and architecture a build is for, but
+/// nothing in it distinguishes glibc from musl. Comparisons against a detected
+/// platform therefore have to be made on this much and no more.
+pub fn platform_of(target: &str) -> &str {
+    let mut parts = target.char_indices().filter(|(_, c)| *c == ' ');
+    match (parts.next(), parts.next()) {
+        (Some(_), Some((second, _))) => &target[..second],
+        _ => target,
+    }
 }
 
 /// What the last install decided, persisted so the monotonicity check survives
@@ -428,6 +450,29 @@ mod tests {
             sibling(Path::new("C:/bin/relay-agent.exe"), ".relay-update"),
             PathBuf::from("C:/bin/relay-agent.exe.relay-update")
         );
+    }
+
+    #[test]
+    fn a_libc_qualifier_is_stripped_when_comparing_platforms() {
+        // An ELF header names an OS and an architecture and nothing else, so a
+        // musl release can only ever be verified against this much of its
+        // target. Getting it wrong would make every musl publish look
+        // mislabeled and be skipped.
+        assert_eq!(platform_of("linux x86_64 musl"), "linux x86_64");
+        assert_eq!(platform_of("linux x86_64"), "linux x86_64");
+        assert_eq!(platform_of("macos aarch64"), "macos aarch64");
+        assert_eq!(platform_of("windows"), "windows");
+        assert_eq!(platform_of(""), "");
+    }
+
+    #[test]
+    fn this_build_reports_a_platform_that_survives_the_round_trip() {
+        // Whatever this binary was built as, the controller has to be able to
+        // compare it against a detected platform without the string changing
+        // shape.
+        let target = current_target();
+        assert!(target.starts_with(platform_of(&target)));
+        assert_eq!(platform_of(&target).split(' ').count(), 2);
     }
 
     #[test]

@@ -861,8 +861,12 @@ async fn check_for_release(
         // The asset name is a claim; the header is evidence. Publishing a
         // mislabeled asset would send an aarch64 build to x86-64 machines,
         // where every agent would refuse it and the rollout would never end.
+        //
+        // Compared on OS and architecture only: nothing in an ELF header
+        // distinguishes a glibc build from a musl one, so a target carrying a
+        // libc qualifier cannot be matched in full.
         let actual = detect_target(&downloaded).await?;
-        if actual.as_deref() != Some(target.as_str()) {
+        if actual.as_deref() != Some(common::update::platform_of(&target)) {
             tracing::warn!(
                 %repo, tag = %release.tag, %target, asset = %name,
                 detected = actual.as_deref().unwrap_or("unrecognised"),
