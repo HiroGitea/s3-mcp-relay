@@ -1,6 +1,6 @@
 ---
 name: relay-ops
-description: Operating remote machines through the S3 relay - choosing between exec and start_job, moving files without blowing up the context, installing packages onto a host with no internet, and reading the failure modes correctly. Load when working with s3-relay MCP tools (list_agents, exec, push_file, start_job, publish_update), when a relay command times out, or when a download, pip install, apt-get or git clone fails on the agent.
+description: Operating machines through the S3 relay - exec vs start_job, moving files without flooding the context, installing onto a host with no internet, and reading its failure modes. Load when using s3-relay tools, when a relay command times out, or when pip/apt/curl/git fails on the agent.
 ---
 
 # Operating the S3 relay
@@ -33,6 +33,25 @@ set.
 Choosing `exec` for a long task does not fail cleanly — it times out, and the
 program **keeps running** on the agent with nobody watching it. If you are not
 sure, use `start_job`.
+
+### One command at a time
+
+An agent executes commands **serially**. It claims everything waiting for it in
+one pass, then runs them one after another; the second cannot start until the
+first returns.
+
+This bites in a way that reads like a random failure. Commands expire — 120
+seconds by default — and expiry is checked when a command is about to run, not
+when it is claimed. So if you send five and the first takes four minutes, the
+rest have already been taken out of the bucket, and each is refused in turn with
+"command expired before execution". They were consumed and never ran.
+
+So do not fan out `exec` calls expecting them to overlap. They queue, and the
+slow one at the front can starve the others past their deadline.
+
+`start_job` is the exception and the answer: jobs are detached, run concurrently
+with each other, and do not block the command loop at all. Several long things
+at once means several jobs, not several execs.
 
 ### read_file vs pull_file
 

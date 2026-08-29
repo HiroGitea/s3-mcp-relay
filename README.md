@@ -188,6 +188,13 @@ Restart the MCP client and invoke `list_agents`.
 > the remote process may continue without supervision. Use `start_job` for
 > builds, training, imports, or any operation that may take several minutes.
 
+An agent runs commands **one at a time**, and expiry is checked when a command
+is about to run rather than when it is claimed. Send several at once and a slow
+one at the front can hold the rest past their 120-second deadline, at which
+point they are refused as expired — having already been consumed. Concurrency
+comes from `start_job`, whose jobs are detached and do not block the command
+loop.
+
 `read_file` returns content inside the tool result, so it lands in the model's
 context — 100 KB is roughly 40k tokens. Use `pull_file` for anything larger.
 

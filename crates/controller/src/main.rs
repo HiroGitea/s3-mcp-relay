@@ -217,7 +217,7 @@ struct RetractUpdateArgs {
 
 #[tool_router(server_handler)]
 impl Controller {
-    #[tool(description = "List currently live relay agents. Stale heartbeat objects are deleted.")]
+    #[tool(description = "List live agents: version, running jobs, recent errors, CPU and GPU metrics.")]
     async fn list_agents(&self) -> Result<CallToolResult, McpError> {
         let mut agents = Vec::new();
         for (id, transport) in self.transports.iter() {
@@ -231,12 +231,12 @@ impl Controller {
         self.json_result(&agents)
     }
 
-    #[tool(description = "Check that a specific remote agent is online and responding through S3.")]
+    #[tool(description = "Round-trip check that one agent is alive.")]
     async fn ping(&self, Parameters(args): Parameters<AgentArg>) -> Result<CallToolResult, McpError> {
         self.run(args.agent_id, CommandKind::Ping, 10).await
     }
 
-    #[tool(description = "Run one allowlisted program directly on the remote agent. No shell is used and arguments are not expanded.")]
+    #[tool(description = "Run one program on the agent. No shell, arguments never expanded. An agent runs commands one at a time, so a slow one delays everything queued behind it — use start_job for anything past a few minutes.")]
     async fn exec(&self, Parameters(args): Parameters<ExecArgs>) -> Result<CallToolResult, McpError> {
         let timeout = args.timeout_secs.unwrap_or(60).clamp(1, self.max_exec_secs);
         let stdin_b64 = args.stdin.map(|value| B64.encode(value.as_bytes()));
@@ -245,7 +245,7 @@ impl Controller {
         }, timeout).await
     }
 
-    #[tool(description = "Read a file under an agent-side allowed root. Text mode validates UTF-8; binary mode returns base64.")]
+    #[tool(description = "Read a file from the agent. Text validates UTF-8, binary returns base64. Above ~100 KB use pull_file instead: this lands in the conversation.")]
     async fn read_file(&self, Parameters(args): Parameters<ReadFileArgs>) -> Result<CallToolResult, McpError> {
         let binary = args.binary;
         let result = self.relay(args.agent_id, CommandKind::ReadFile {
@@ -270,7 +270,7 @@ impl Controller {
         }
     }
 
-    #[tool(description = "Create, overwrite, or append a file under an agent-side allowed root.")]
+    #[tool(description = "Create, overwrite, or append a file on the agent.")]
     async fn write_file(&self, Parameters(args): Parameters<WriteFileArgs>) -> Result<CallToolResult, McpError> {
         let contents_b64 = if args.base64 {
             if let Err(error) = B64.decode(&args.content) {
@@ -285,12 +285,12 @@ impl Controller {
         }, 30).await
     }
 
-    #[tool(description = "List a directory under an agent-side allowed root.")]
+    #[tool(description = "List a directory on the agent.")]
     async fn list_dir(&self, Parameters(args): Parameters<ListDirArgs>) -> Result<CallToolResult, McpError> {
         self.run(args.agent_id, CommandKind::ListDir { path: args.path }, 30).await
     }
 
-    #[tool(description = "Start a long-running program on the remote agent and return immediately with a job id. Use this instead of exec for anything that outlasts a few minutes — model training, large builds, batch jobs. Output streams to a file on the agent; poll with list_jobs / job_output. The outcome also rides home on the heartbeat, so list_agents shows finished jobs even if nothing polled.")]
+    #[tool(description = "Start a long-running program and return a job id immediately. Use instead of exec for anything past a few minutes — training, builds, batch imports. Jobs run concurrently and do not block commands. Poll with list_jobs or job_output.")]
     async fn start_job(&self, Parameters(args): Parameters<StartJobArgs>) -> Result<CallToolResult, McpError> {
         let job = blob::new_transfer_id();
         let max_runtime_secs = args.max_runtime_secs.unwrap_or(21_600); // 6h
@@ -304,45 +304,45 @@ impl Controller {
         }, 60).await
     }
 
-    #[tool(description = "List jobs on the remote agent: running ones first, then recently finished with their exit codes.")]
+    #[tool(description = "List running and recently finished jobs with their exit codes.")]
     async fn list_jobs(&self, Parameters(args): Parameters<AgentArg>) -> Result<CallToolResult, McpError> {
         self.run(args.agent_id, CommandKind::ListJobs, 30).await
     }
 
-    #[tool(description = "Fetch the tail of a job's stdout and stderr. The full logs stay on the agent; use pull_file with the returned paths to retrieve them whole.")]
+    #[tool(description = "Tail a job's stdout and stderr. Use pull_file on the returned paths for the whole log.")]
     async fn job_output(&self, Parameters(args): Parameters<JobOutputArgs>) -> Result<CallToolResult, McpError> {
         self.run(args.agent_id, CommandKind::JobOutput {
             job: args.job, tail_bytes: args.tail_bytes,
         }, 30).await
     }
 
-    #[tool(description = "Kill a running job on the remote agent.")]
+    #[tool(description = "Kill a running job.")]
     async fn cancel_job(&self, Parameters(args): Parameters<JobArg>) -> Result<CallToolResult, McpError> {
         self.run(args.agent_id, CommandKind::CancelJob { job: args.job }, 30).await
     }
 
-    #[tool(description = "Create a directory on the remote agent. Succeeds if it already exists.")]
+    #[tool(description = "Create a directory on the agent.")]
     async fn make_dir(&self, Parameters(args): Parameters<MakeDirArgs>) -> Result<CallToolResult, McpError> {
         self.run(args.agent_id, CommandKind::MakeDir {
             path: args.path, parents: args.parents,
         }, 30).await
     }
 
-    #[tool(description = "Delete a file or directory on the remote agent. Deleting a non-empty directory requires recursive=true.")]
+    #[tool(description = "Delete a file or directory. A non-empty directory needs recursive=true.")]
     async fn remove(&self, Parameters(args): Parameters<RemoveArgs>) -> Result<CallToolResult, McpError> {
         self.run(args.agent_id, CommandKind::Remove {
             path: args.path, recursive: args.recursive,
         }, 60).await
     }
 
-    #[tool(description = "Move or rename a path on the remote agent. Both ends must be inside the allowed roots.")]
+    #[tool(description = "Move or rename a path on the agent.")]
     async fn move_path(&self, Parameters(args): Parameters<MoveArgs>) -> Result<CallToolResult, McpError> {
         self.run(args.agent_id, CommandKind::Move {
             from: args.from, to: args.to,
         }, 60).await
     }
 
-    #[tool(description = "Copy a file from this machine to the remote agent, streaming it through the bucket. Bulk data never enters the conversation, so this is how to move large files such as wheels, archives or installers. Missing destination directories are created.")]
+    #[tool(description = "Send a local file to the agent, streamed through the bucket. Use for anything large; the bytes never enter the conversation. Creates missing directories.")]
     async fn push_file(&self, Parameters(args): Parameters<PushFileArgs>) -> Result<CallToolResult, McpError> {
         match self.push(args).await {
             Ok(value) => self.json_result(&value),
@@ -350,7 +350,7 @@ impl Controller {
         }
     }
 
-    #[tool(description = "Copy a file from the remote agent to this machine, streaming it through the bucket.")]
+    #[tool(description = "Fetch a file from the agent, streamed through the bucket.")]
     async fn pull_file(&self, Parameters(args): Parameters<PullFileArgs>) -> Result<CallToolResult, McpError> {
         match self.pull(args).await {
             Ok(value) => self.json_result(&value),
@@ -358,7 +358,7 @@ impl Controller {
         }
     }
 
-    #[tool(description = "Stop one specific agent process when two are sharing an identity — normally two machines cloned from one disk image. Both suspend themselves on detecting the collision and one yields automatically; use this to choose which machine keeps working instead. Take the instance id from list_agents. The other side resumes once this one is gone.")]
+    #[tool(description = "Stop one agent process when two share an identity, usually from a cloned image. Both suspend and one yields automatically; use this to pick which keeps working. Instance id comes from list_agents.")]
     async fn stand_down(&self, Parameters(args): Parameters<StandDownArgs>) -> Result<CallToolResult, McpError> {
         if args.instance.trim().is_empty() {
             return Ok(tool_error("instance must name the process to stop"));
@@ -370,7 +370,7 @@ impl Controller {
         }
     }
 
-    #[tool(description = "Publish a new relay-agent binary to the fleet through the bucket. The binary is uploaded once no matter how many agents there are, and each agent installs it on its own schedule — including machines that are offline right now, which pick it up when they return. An agent whose platform does not match refuses it, so a mixed fleet needs one call per architecture. Agents defer the restart until their running jobs finish, and roll back if the new binary fails to start.")]
+    #[tool(description = "Publish a new relay-agent binary to the fleet. Uploaded once for any number of agents; each installs on its own schedule, including machines offline right now. One call per architecture — an agent refuses a build for another platform.")]
     async fn publish_update(&self, Parameters(args): Parameters<PublishUpdateArgs>) -> Result<CallToolResult, McpError> {
         match self.publish(args).await {
             Ok(value) => self.json_result(&value),
@@ -378,7 +378,7 @@ impl Controller {
         }
     }
 
-    #[tool(description = "Show what each agent is running against what has been published to it: version, platform, and whether the published release has been installed yet.")]
+    #[tool(description = "Show what each agent runs against what has been published to it.")]
     async fn update_status(&self) -> Result<CallToolResult, McpError> {
         let mut rows = Vec::new();
         for (id, transport) in self.transports.iter() {
@@ -414,7 +414,7 @@ impl Controller {
         self.json_result(&rows)
     }
 
-    #[tool(description = "Withdraw a published update so agents that have not installed it yet will not. Agents that already restarted into it are unaffected — publish the previous binary to move those back.")]
+    #[tool(description = "Withdraw a published update from agents that have not installed it yet. Ones that already restarted into it are unaffected.")]
     async fn retract_update(&self, Parameters(args): Parameters<RetractUpdateArgs>) -> Result<CallToolResult, McpError> {
         let agents = match self.targets(args.agents) {
             Ok(agents) => agents,
