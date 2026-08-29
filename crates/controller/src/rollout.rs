@@ -109,6 +109,44 @@ pub async fn sweep(
     Ok(swept)
 }
 
+/// Grace before chunks without a manifest count as a failed upload rather than
+/// one still running. A dataset over a slow link can take hours, and deleting
+/// an upload in progress is worse than paying for a day of storage.
+const ORPHAN_GRACE: Duration = Duration::from_secs(24 * 3600);
+
+/// Delete shared files past their expiry, and chunks left by uploads that died.
+pub async fn sweep_shares(
+    transport: &Transport,
+    crypto: &common::Crypto,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let now = common::protocol::now_unix();
+    let mut expired = Vec::new();
+    for name in transport.list_shares().await? {
+        match transport.read_share_manifest(&name, crypto).await {
+            // Zero means keep indefinitely, which is what an explicit retention
+            // of "none" records.
+            Ok(Some(m)) if m.expires_at > 0 && m.expires_at <= now => {
+                transport
+                    .delete_share(&name)
+                    .await
+                    .with_context(|| format!("delete expired share {name}"))?;
+                expired.push(name);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%name, %error, "unreadable share manifest"),
+        }
+    }
+    let mut orphaned = Vec::new();
+    for name in transport.list_share_orphans(ORPHAN_GRACE).await? {
+        transport
+            .delete_share(&name)
+            .await
+            .with_context(|| format!("delete orphaned share {name}"))?;
+        orphaned.push(name);
+    }
+    Ok((expired, orphaned))
+}
+
 /// One asset of a published GitHub release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {

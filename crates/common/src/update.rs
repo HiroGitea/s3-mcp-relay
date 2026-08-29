@@ -362,28 +362,22 @@ pub async fn stage_release(
     crypto: &Crypto,
     source: &Path,
 ) -> Result<(u32, u64, String)> {
-    let mut file = tokio::fs::File::open(source)
-        .await
-        .with_context(|| format!("open {}", source.display()))?;
-    let mut hasher = Hasher::new();
-    let mut buffer = vec![0u8; BLOB_CHUNK_BYTES];
-    let mut chunks: u32 = 0;
-    let mut total_bytes: u64 = 0;
-    loop {
-        let read = fill(&mut file, &mut buffer).await?;
-        if read == 0 && chunks > 0 {
-            break;
-        }
-        let data = &buffer[..read];
-        hasher.update(data);
-        transport.put_release_chunk(release, chunks, data, crypto).await?;
-        total_bytes = total_bytes.saturating_add(read as u64);
-        chunks = chunks.checked_add(1).context("release has too many chunks")?;
-        if read < buffer.len() {
-            break;
-        }
-    }
-    Ok((chunks, total_bytes, hasher.finish_hex()))
+    let (owned_transport, owned_release, owned_crypto) =
+        (transport.clone(), release.to_owned(), crypto.clone());
+    crate::blob::upload_chunks(
+        source,
+        BLOB_CHUNK_BYTES,
+        crate::blob::configured_upload_concurrency(),
+        move |index, data| {
+            let (transport, release, crypto) = (
+                owned_transport.clone(),
+                owned_release.clone(),
+                owned_crypto.clone(),
+            );
+            async move { transport.put_release_chunk(&release, index, &data, &crypto).await }
+        },
+    )
+    .await
 }
 
 /// Fresh 32-byte release key, base64 encoded. One per publish: it is only ever

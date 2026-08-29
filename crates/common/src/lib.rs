@@ -27,7 +27,7 @@ pub use config::{optional_env, required_env, S3Config};
 pub use crypto::Crypto;
 pub use protocol::{
     validate_agent_id, validate_transfer_id, Command, CommandKind, DirEntry, Doorbell, Heartbeat, LogChunk,
-    Response, ResponsePayload, UpdateManifest,
+    Response, ResponsePayload, ShareManifest, UpdateManifest,
 };
 pub use transport::Transport;
 

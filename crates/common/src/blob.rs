@@ -28,6 +28,87 @@ pub struct Manifest {
     pub sha256: String,
 }
 
+/// Chunk uploads kept in flight at once.
+///
+/// Sequential uploads waste most of a high-latency link: one 8 MiB PUT to an
+/// endpoint 140 ms away spends far longer waiting than sending, and the window
+/// never opens up. Overlapping them is what turns that into usable throughput.
+///
+/// The ceiling is memory, not the network. Every upload in flight holds its
+/// plaintext *and* its ciphertext, so peak use is roughly
+/// `concurrency × chunk_size × 2` — at 64 × 8 MiB that is a gigabyte, which is
+/// fine on a 251 GB training box and fatal on a 4 GB Jetson. Hence a modest
+/// default and an explicit budget below.
+pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 8;
+pub const MAX_UPLOAD_CONCURRENCY: usize = 64;
+/// Memory the in-flight chunks may occupy. Concurrency is reduced to fit.
+const UPLOAD_MEMORY_BUDGET: usize = 256 * 1024 * 1024;
+
+/// How many uploads may overlap for a given chunk size, honouring the budget.
+pub fn upload_concurrency(requested: usize, chunk_size: usize) -> usize {
+    let requested = requested.clamp(1, MAX_UPLOAD_CONCURRENCY);
+    let per_chunk = chunk_size.saturating_mul(2).max(1);
+    let affordable = (UPLOAD_MEMORY_BUDGET / per_chunk).max(1);
+    requested.min(affordable)
+}
+
+/// Read `source` in chunks and upload them with `put`, up to `concurrency` at
+/// a time, returning the chunk count, byte count and SHA-256.
+///
+/// Reading and hashing stay sequential — the hash is order-dependent and a file
+/// read is fast next to a network round trip. Only the uploads overlap.
+pub async fn upload_chunks<F, Fut>(
+    source: &Path,
+    chunk_size: usize,
+    concurrency: usize,
+    put: F,
+) -> Result<(u32, u64, String)>
+where
+    F: Fn(u32, Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let concurrency = upload_concurrency(concurrency, chunk_size);
+    let mut file = tokio::fs::File::open(source)
+        .await
+        .with_context(|| format!("open {}", source.display()))?;
+    let mut hasher = Hasher::new();
+    let mut buffer = vec![0u8; chunk_size];
+    let mut chunks: u32 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut inflight = tokio::task::JoinSet::new();
+
+    loop {
+        let read = fill(&mut file, &mut buffer).await?;
+        if read == 0 && chunks > 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total_bytes = total_bytes.saturating_add(read as u64);
+        let index = chunks;
+        let data = buffer[..read].to_vec();
+        let future = put(index, data);
+        inflight.spawn(future);
+        chunks = chunks.checked_add(1).context("file has too many chunks")?;
+
+        // Bound the number in flight, and surface a failure as soon as it
+        // happens rather than after reading the rest of the file.
+        while inflight.len() >= concurrency {
+            match inflight.join_next().await {
+                Some(joined) => joined.context("upload task panicked")??,
+                None => break,
+            }
+        }
+        if read < buffer.len() {
+            break;
+        }
+    }
+
+    while let Some(joined) = inflight.join_next().await {
+        joined.context("upload task panicked")??;
+    }
+    Ok((chunks, total_bytes, hasher.finish_hex()))
+}
+
 /// Split a local file into sealed chunks in the bucket.
 ///
 /// Both ends use this: the controller when pushing a file out, the agent when
@@ -40,30 +121,32 @@ pub async fn stage_file(
     transfer: &str,
     source: &Path,
 ) -> Result<Manifest> {
-    let mut file = tokio::fs::File::open(source)
-        .await
-        .with_context(|| format!("open {}", source.display()))?;
-    let mut hasher = Hasher::new();
-    let mut buffer = vec![0u8; BLOB_CHUNK_BYTES];
-    let mut chunks: u32 = 0;
-    let mut total_bytes: u64 = 0;
-    loop {
-        let read = fill(&mut file, &mut buffer).await?;
-        // An empty file still produces one empty chunk, so a transfer always
-        // has at least one object and the receiver needs no special case.
-        if read == 0 && chunks > 0 {
-            break;
-        }
-        let data = &buffer[..read];
-        hasher.update(data);
-        transport.put_blob_chunk(agent, transfer, chunks, data).await?;
-        total_bytes = total_bytes.saturating_add(read as u64);
-        chunks = chunks.checked_add(1).context("file has too many chunks")?;
-        if read < buffer.len() {
-            break;
-        }
-    }
-    Ok(Manifest { chunks, total_bytes, sha256: hasher.finish_hex() })
+    let (owned_transport, owned_agent, owned_transfer) =
+        (transport.clone(), agent.to_owned(), transfer.to_owned());
+    // An empty file still produces one empty chunk, so a transfer always has at
+    // least one object and the receiver needs no special case.
+    let (chunks, total_bytes, sha256) = upload_chunks(
+        source,
+        BLOB_CHUNK_BYTES,
+        configured_upload_concurrency(),
+        move |index, data| {
+            let (transport, agent, transfer) = (
+                owned_transport.clone(),
+                owned_agent.clone(),
+                owned_transfer.clone(),
+            );
+            async move { transport.put_blob_chunk(&agent, &transfer, index, &data).await }
+        },
+    )
+    .await?;
+    Ok(Manifest { chunks, total_bytes, sha256 })
+}
+
+/// Upload concurrency from configuration, for both ends of the relay.
+pub fn configured_upload_concurrency() -> usize {
+    crate::optional_env("RELAY_UPLOAD_CONCURRENCY")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_UPLOAD_CONCURRENCY)
 }
 
 /// Rebuild a staged transfer at `dest` and verify it against `manifest`.
@@ -228,6 +311,67 @@ mod tests {
         hasher.update(b"hello ");
         hasher.update(b"world");
         assert_eq!(hasher.finish_hex(), sha256_hex(b"hello world"));
+    }
+
+    #[test]
+    fn concurrency_is_capped_by_memory_not_by_the_request() {
+        // Each upload in flight holds plaintext and ciphertext, so the product
+        // of concurrency and chunk size is what has to stay bounded. Asking for
+        // 64 at 8 MiB would be a gigabyte — fine on a training box, fatal on a
+        // 4 GB Jetson, and the caller cannot be expected to know which it is on.
+        assert_eq!(upload_concurrency(64, 8 * 1024 * 1024), 16);
+        assert_eq!(upload_concurrency(64, 1024 * 1024), 64);
+        // A request below the ceiling is honoured as-is.
+        assert_eq!(upload_concurrency(4, 8 * 1024 * 1024), 4);
+        // Never zero: that would upload nothing at all.
+        assert_eq!(upload_concurrency(0, 8 * 1024 * 1024), 1);
+        assert_eq!(upload_concurrency(1000, usize::MAX), 1);
+    }
+
+    #[tokio::test]
+    async fn uploads_every_chunk_exactly_once_and_hashes_in_order() {
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!("relay-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.bin");
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &payload).unwrap();
+
+        let seen: Arc<Mutex<Vec<(u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let (chunks, bytes, sha) = upload_chunks(&path, 1024, 8, move |index, data| {
+            let recorder = recorder.clone();
+            async move {
+                recorder.lock().unwrap().push((index, data.len()));
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, payload.len() as u64);
+        assert_eq!(chunks, 10, "10000 bytes in 1024-byte chunks");
+        // Order of completion is not guaranteed, but coverage is: every index
+        // exactly once, and the hash must match a plain sequential digest.
+        let mut indices: Vec<u32> = seen.lock().unwrap().iter().map(|(i, _)| *i).collect();
+        indices.sort();
+        assert_eq!(indices, (0..10).collect::<Vec<_>>());
+        assert_eq!(sha, sha256_hex(&payload));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failing_chunk_fails_the_whole_upload() {
+        let dir = std::env::temp_dir().join(format!("relay-upfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.bin");
+        std::fs::write(&path, vec![0u8; 5000]).unwrap();
+        let result = upload_chunks(&path, 1024, 4, |index, _data| async move {
+            if index == 2 { anyhow::bail!("simulated failure") } else { Ok(()) }
+        })
+        .await;
+        assert!(result.is_err(), "one bad chunk must not produce a manifest");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

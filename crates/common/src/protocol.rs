@@ -184,6 +184,32 @@ pub enum CommandKind {
         from: String,
         to: String,
     },
+    /// Copy a local file into the shared area, where any agent can fetch it.
+    ///
+    /// The bytes go straight from this agent to the bucket. They never pass
+    /// through the controller, which is the entire point: on a fleet where the
+    /// controller sits on a domestic uplink and the agents sit in data centres,
+    /// relaying a dataset through it is thousands of times slower than letting
+    /// the machines that have bandwidth talk to the store directly.
+    SharePut {
+        /// Name in the shared area. Becomes part of an S3 key.
+        name: String,
+        /// File on this agent to publish.
+        path: String,
+        /// Base64 key the shared area is sealed with. Travels inside this
+        /// sealed command; agents do not store it.
+        key_b64: String,
+        /// Recorded in the manifest for the controller to sweep on. Zero keeps
+        /// it indefinitely.
+        #[serde(default)]
+        expires_at: i64,
+    },
+    /// Write a file from the shared area onto this agent.
+    ShareGet {
+        name: String,
+        dest_path: String,
+        key_b64: String,
+    },
     /// Stop consuming commands, permanently, until this process is restarted.
     ///
     /// The manual half of collision handling: when two agents share an
@@ -288,6 +314,13 @@ pub enum ResponsePayload {
     BlobWritten { bytes: u64, sha256: String },
     /// A `PullBlob` is staged in the bucket and ready for the controller.
     BlobStaged { chunks: u32, total_bytes: u64, sha256: String },
+    /// A file was published to, or fetched from, the shared area.
+    Shared {
+        name: String,
+        chunks: u32,
+        total_bytes: u64,
+        sha256: String,
+    },
     Empty,
 }
 
@@ -480,6 +513,46 @@ impl Heartbeat {
     }
 }
 
+/// A file in the shared area, and what a fetching agent needs to rebuild it.
+///
+/// Stored in the bucket beside the chunks it describes, sealed with the same
+/// shared key — unlike an update manifest, which is per-agent, because the
+/// whole purpose here is that any agent can read it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareManifest {
+    pub name: String,
+    pub chunks: u32,
+    pub total_bytes: u64,
+    /// Lowercase hex SHA-256 of the assembled file.
+    pub sha256: String,
+    /// Which agent published it, and when. Reporting only.
+    pub source_agent: AgentId,
+    pub created_at: i64,
+    /// When the controller may delete this. Absolute rather than a duration, so
+    /// changing the retention policy later does not silently move the deadline
+    /// of something already published. Zero means keep indefinitely.
+    #[serde(default)]
+    pub expires_at: i64,
+}
+
+/// Names in the shared area become S3 keys, so they get the same treatment as
+/// agent ids: a restricted alphabet, no separators, no traversal.
+pub fn validate_share_name(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 128 {
+        bail!("share name must contain 1..=128 characters");
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        bail!("share name may contain only ASCII letters, digits, '-', '_' and '.'");
+    }
+    if value.starts_with('.') || value.contains("..") {
+        bail!("share name must not start with '.' or contain '..'");
+    }
+    Ok(())
+}
+
 /// What the controller published for one agent to install, and everything that
 /// agent needs to fetch and trust it.
 ///
@@ -555,6 +628,20 @@ pub fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_share_names_that_can_escape_the_prefix() {
+        assert!(validate_share_name("HRSSD.zip").is_ok());
+        assert!(validate_share_name("dataset-v2_final").is_ok());
+        // These become S3 keys, so the same rules apply as to agent ids.
+        assert!(validate_share_name("../secrets").is_err());
+        assert!(validate_share_name("a/b").is_err());
+        assert!(validate_share_name(".hidden").is_err());
+        assert!(validate_share_name("with space").is_err());
+        assert!(validate_share_name("").is_err());
+        // A name that is only dots would collide with directory traversal.
+        assert!(validate_share_name("..").is_err());
+    }
 
     #[test]
     fn rejects_agent_ids_that_can_escape_prefix() {

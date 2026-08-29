@@ -179,6 +179,7 @@ Restart the MCP client and invoke `list_agents`.
 | `push_file` · `pull_file` | Any size, streamed through the bucket |
 | `list_dir` · `make_dir` · `remove` · `move_path` | Path management |
 | `publish_update` · `update_status` · `retract_update` | Roll a new agent binary out to the fleet |
+| `share_put` · `share_get` · `share_list` · `share_remove` | Move data between agents without crossing the controller |
 | `stand_down` | Stop one process when two agents share an identity |
 
 ### Tool selection
@@ -413,6 +414,45 @@ not match the platform its name claims is refused rather than published, and
 that a version already rolled out is not uploaded again — the ledger outlives
 the release in the bucket, so a completed-and-swept rollout is not restarted
 from scratch. Each agent still applies all five of its own checks on top.
+
+## Moving data between agents
+
+`push_file` and `pull_file` both route through the controller, which is the
+wrong shape for a dataset. On a typical fleet the controller sits behind a
+domestic uplink while the agents sit in data centres, so relaying 10 GB through
+it costs two crossings of the slowest link in the system — days, where the
+machines that actually have bandwidth could do it in minutes.
+
+The shared area avoids it entirely:
+
+```text
+share_put(agent_id="gpu-01", remote_path="/data/set.zip", name="set.zip")
+share_get(agent_id="gpu-02", name="set.zip", remote_path="/data/set.zip")
+```
+
+The publishing agent streams straight to the bucket; every other agent fetches
+from it directly and verifies the publisher's SHA-256. The controller only ever
+sends a few hundred bytes of command. Upload once, fetch from as many machines
+as you like — including ones enrolled later.
+
+Chunks upload concurrently (`relay.upload_concurrency`, default 8). Raising it
+helps most on a high-latency path, where a single stream spends its time
+waiting rather than sending. The ceiling is memory, not the network: each
+upload in flight holds its plaintext and its ciphertext, so the practical limit
+is `concurrency × 8 MiB × 2` and the setting is clamped to fit a 256 MB budget.
+
+Entries expire after `controller.share_retention_days` (7 by default), swept by
+the same loop that retires finished rollouts. Chunks left behind by an upload
+that died are removed too, once they have been untouched for a day — long
+enough that a slow legitimate upload is never mistaken for wreckage. Pass
+`expire_days: 0` to keep something until you remove it by hand.
+
+> [!WARNING]
+> The shared area is sealed with one key for the whole fleet, because an area
+> only its author can decrypt is not shared. Any enrolled agent can therefore
+> read everything in it, and one compromised agent exposes all of it. Commands,
+> responses, heartbeats and logs keep their own per-agent keys and are
+> unaffected.
 
 ## Two agents on one identity
 

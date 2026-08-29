@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use crate::jobs::{self, JobManager};
 use common::blob::{self, Manifest};
-use common::{optional_env, Command, CommandKind, DirEntry, Response, ResponsePayload, Transport};
+use common::{optional_env, Command, CommandKind, Crypto, DirEntry, Response, ResponsePayload, Transport};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Clone)]
@@ -275,6 +275,12 @@ async fn run(
         CommandKind::PullBlob { transfer, path, max_bytes } => {
             pull_blob(cmd, policy, transport, transfer, path, *max_bytes).await
         }
+        CommandKind::SharePut { name, path, key_b64, expires_at } => {
+            share_put(cmd, policy, transport, name, path, key_b64, *expires_at).await
+        }
+        CommandKind::ShareGet { name, dest_path, key_b64 } => {
+            share_get(cmd, policy, transport, name, dest_path, key_b64).await
+        }
         CommandKind::StartJob { job, program, args, cwd, max_runtime_secs, label } => {
             start_job(cmd, policy, jobs, job, program, args, cwd.as_deref(), *max_runtime_secs, label.clone())
         }
@@ -405,6 +411,166 @@ async fn move_path(cmd: &Command, policy: &Policy, from: &str, to: &str) -> Resu
 /// after the hash matches, so an interrupted transfer never leaves something
 /// that looks like a complete file. Rename within a directory is atomic on both
 /// Unix and Windows.
+/// Publish a local file into the shared area.
+///
+/// The bytes go from this machine straight to the bucket. Nothing passes
+/// through the controller, which on a fleet whose controller sits behind a
+/// domestic uplink is the difference between minutes and days.
+async fn share_put(
+    cmd: &Command,
+    policy: &Policy,
+    transport: &Transport,
+    name: &str,
+    path: &str,
+    key_b64: &str,
+    expires_at: i64,
+) -> Result<Response> {
+    common::protocol::validate_share_name(name)?;
+    let source = policy.check_existing_path(path)?;
+    let size = tokio::fs::metadata(&source).await?.len();
+    if size > policy.max_blob_bytes {
+        bail!("{size} bytes exceeds AGENT_MAX_BLOB_BYTES");
+    }
+    let crypto = Crypto::from_base64(key_b64, "share")?;
+
+    let (owned_transport, owned_name, owned_crypto) =
+        (transport.clone(), name.to_owned(), crypto.clone());
+    let staged = blob::upload_chunks(
+        &source,
+        common::transport::BLOB_CHUNK_BYTES,
+        blob::configured_upload_concurrency(),
+        move |index, data| {
+            let (transport, name, crypto) = (
+                owned_transport.clone(),
+                owned_name.clone(),
+                owned_crypto.clone(),
+            );
+            async move { transport.put_share_chunk(&name, index, &data, &crypto).await }
+        },
+    )
+    .await;
+
+    let (chunks, total_bytes, sha256) = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            // Nothing references these yet — no manifest was written — so they
+            // are pure litter and safe to remove.
+            let _ = transport.delete_share(name).await;
+            return Err(error);
+        }
+    };
+
+    // Written last, so a reader never finds a manifest describing chunks that
+    // are not all there yet.
+    transport
+        .put_share_manifest(
+            &common::ShareManifest {
+                name: name.to_owned(),
+                chunks,
+                total_bytes,
+                sha256: sha256.clone(),
+                source_agent: cmd.agent_id.clone(),
+                created_at: common::protocol::now_unix(),
+                expires_at,
+            },
+            &crypto,
+        )
+        .await?;
+
+    Ok(Response::ok(
+        cmd,
+        ResponsePayload::Shared { name: name.to_owned(), chunks, total_bytes, sha256 },
+    ))
+}
+
+/// Write a file from the shared area onto this agent.
+async fn share_get(
+    cmd: &Command,
+    policy: &Policy,
+    transport: &Transport,
+    name: &str,
+    dest_path: &str,
+    key_b64: &str,
+) -> Result<Response> {
+    common::protocol::validate_share_name(name)?;
+    let crypto = Crypto::from_base64(key_b64, "share")?;
+    let manifest = transport
+        .read_share_manifest(name, &crypto)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("nothing named {name} in the shared area"))?;
+    if manifest.total_bytes > policy.max_blob_bytes {
+        bail!("{} bytes exceeds AGENT_MAX_BLOB_BYTES", manifest.total_bytes);
+    }
+    let dest = policy.prepare_write_path(dest_path)?;
+
+    // Assembled into a sibling temporary file and renamed only once the hash
+    // matches, so an interrupted fetch never leaves something that looks like a
+    // complete dataset.
+    let temp = {
+        let mut name = dest.file_name().unwrap_or_default().to_os_string();
+        name.push(".relay-partial");
+        dest.with_file_name(name)
+    };
+    let assembled = assemble_share(transport, &manifest, &crypto, &temp).await;
+    match assembled {
+        Ok(()) => {
+            tokio::fs::rename(&temp, &dest)
+                .await
+                .with_context(|| format!("move into {}", dest.display()))?;
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(error);
+        }
+    }
+
+    Ok(Response::ok(
+        cmd,
+        ResponsePayload::Shared {
+            name: manifest.name,
+            chunks: manifest.chunks,
+            total_bytes: manifest.total_bytes,
+            sha256: manifest.sha256,
+        },
+    ))
+}
+
+async fn assemble_share(
+    transport: &Transport,
+    manifest: &common::ShareManifest,
+    crypto: &Crypto,
+    temp: &std::path::Path,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::create(temp)
+        .await
+        .with_context(|| format!("create {}", temp.display()))?;
+    let mut hasher = blob::Hasher::new();
+    let mut written: u64 = 0;
+    for index in 0..manifest.chunks {
+        let data = transport
+            .get_share_chunk(&manifest.name, index, crypto)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("share chunk {index} is missing"))?;
+        written = written.saturating_add(data.len() as u64);
+        if written > manifest.total_bytes {
+            bail!("share carries more bytes than its manifest declares");
+        }
+        hasher.update(&data);
+        file.write_all(&data).await.context("write share chunk")?;
+    }
+    file.flush().await?;
+    if written != manifest.total_bytes {
+        bail!("share assembled {written} bytes, manifest declares {}", manifest.total_bytes);
+    }
+    let sha256 = hasher.finish_hex();
+    if sha256 != manifest.sha256 {
+        bail!("share hash mismatch: manifest says {}, assembled {sha256}", manifest.sha256);
+    }
+    Ok(())
+}
+
 async fn push_blob(
     cmd: &Command,
     policy: &Policy,

@@ -48,6 +48,8 @@ struct Controller {
     /// Transfers get their own, much larger ceiling: moving a few hundred
     /// megabytes legitimately takes longer than any command should.
     max_transfer_secs: u64,
+    /// How long a shared file lives before the cleanup loop removes it.
+    share_retention_days: u64,
     poll_interval: Duration,
 }
 
@@ -195,6 +197,34 @@ struct PublishUpdateArgs {
     /// Version label, for reporting only. Defaults to this controller's own
     /// version. What actually decides whether an agent installs is the hash.
     version: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SharePutArgs {
+    /// Agent that already has the file.
+    agent_id: String,
+    /// Path to it on that agent.
+    remote_path: String,
+    /// Name it takes in the shared area. Letters, digits, '-', '_' and '.'.
+    name: String,
+    /// Delete it after this many days. Defaults to the controller's retention
+    /// (7 days). Zero keeps it until removed by hand.
+    expire_days: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ShareGetArgs {
+    /// Agent that should receive the file.
+    agent_id: String,
+    /// Name in the shared area, from share_list.
+    name: String,
+    /// Where to write it on that agent.
+    remote_path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ShareNameArgs {
+    name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -355,6 +385,77 @@ impl Controller {
         match self.pull(args).await {
             Ok(value) => self.json_result(&value),
             Err(error) => Ok(tool_error(format!("pull failed: {error:#}"))),
+        }
+    }
+
+    #[tool(description = "Publish a file from one agent into the shared area, where any other agent can fetch it. The bytes go straight from that agent to the bucket and never pass through this machine — the way to move a dataset between agents without it crossing the controller's uplink twice.")]
+    async fn share_put(&self, Parameters(args): Parameters<SharePutArgs>) -> Result<CallToolResult, McpError> {
+        let key = match self.registry.share_key() {
+            Ok(key) => key,
+            Err(error) => return Ok(tool_error(format!("no share key: {error:#}"))),
+        };
+        // Absolute, computed here: the agent only records what it is told, so
+        // the deadline of something already published never moves when the
+        // policy changes.
+        let days = args.expire_days.unwrap_or(self.share_retention_days);
+        let expires_at = if days == 0 {
+            0
+        } else {
+            common::protocol::now_unix().saturating_add(days.saturating_mul(86_400) as i64)
+        };
+        self.run(args.agent_id, CommandKind::SharePut {
+            name: args.name, path: args.remote_path, key_b64: key, expires_at,
+        }, self.max_transfer_secs).await
+    }
+
+    #[tool(description = "Write a file from the shared area onto an agent. Fetched by that agent directly from the bucket and verified against the publisher's hash.")]
+    async fn share_get(&self, Parameters(args): Parameters<ShareGetArgs>) -> Result<CallToolResult, McpError> {
+        let key = match self.registry.share_key() {
+            Ok(key) => key,
+            Err(error) => return Ok(tool_error(format!("no share key: {error:#}"))),
+        };
+        self.run(args.agent_id, CommandKind::ShareGet {
+            name: args.name, dest_path: args.remote_path, key_b64: key,
+        }, self.max_transfer_secs).await
+    }
+
+    #[tool(description = "List what is in the shared area, with size, hash and which agent published each entry.")]
+    async fn share_list(&self) -> Result<CallToolResult, McpError> {
+        let (Some(transport), Ok(key)) = (self.transports.values().next(), self.registry.share_key())
+        else {
+            return Ok(tool_error("no agents enrolled"));
+        };
+        let crypto = match Crypto::from_base64(&key, "share") {
+            Ok(crypto) => crypto,
+            Err(error) => return Ok(tool_error(format!("share key unusable: {error:#}"))),
+        };
+        let names = match transport.list_shares().await {
+            Ok(names) => names,
+            Err(error) => return Ok(tool_error(format!("list failed: {error:#}"))),
+        };
+        let mut entries = Vec::new();
+        for name in names {
+            match transport.read_share_manifest(&name, &crypto).await {
+                Ok(Some(m)) => entries.push(json!({
+                    "name": m.name, "bytes": m.total_bytes, "sha256": m.sha256,
+                    "published_by": m.source_agent, "created_at": m.created_at,
+                    "expires_at": if m.expires_at > 0 { json!(m.expires_at) } else { json!("never") },
+                })),
+                Ok(None) => {}
+                Err(error) => entries.push(json!({ "name": name, "error": format!("{error:#}") })),
+            }
+        }
+        self.json_result(&entries)
+    }
+
+    #[tool(description = "Delete an entry from the shared area. Agents that already fetched it keep their copy.")]
+    async fn share_remove(&self, Parameters(args): Parameters<ShareNameArgs>) -> Result<CallToolResult, McpError> {
+        let Some(transport) = self.transports.values().next() else {
+            return Ok(tool_error("no agents enrolled"));
+        };
+        match transport.delete_share(&args.name).await {
+            Ok(()) => self.json_result(&json!({ "removed": args.name })),
+            Err(error) => Ok(tool_error(format!("remove failed: {error:#}"))),
         }
     }
 
@@ -840,6 +941,23 @@ async fn cleanup_loop(controller: Controller, policy: rollout::Policy, every: Du
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "rollout sweep failed"),
         }
+
+        // Shared files expire on their own schedule; nothing consumes them, so
+        // without this they accumulate and are billed for indefinitely.
+        let share = controller.registry.share_key().ok()
+            .and_then(|key| Crypto::from_base64(&key, "share").ok());
+        if let (Some(transport), Some(crypto)) = (controller.transports.values().next(), share) {
+            match rollout::sweep_shares(transport, &crypto).await {
+                Ok((expired, orphaned)) if !expired.is_empty() || !orphaned.is_empty() => {
+                    tracing::info!(
+                        expired = expired.len(), orphaned = orphaned.len(),
+                        "swept the shared area"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "share sweep failed"),
+            }
+        }
     }
 }
 
@@ -1022,6 +1140,8 @@ fn action_of(kind: &CommandKind) -> &'static str {
         CommandKind::JobOutput { .. } => "job_output",
         CommandKind::CancelJob { .. } => "cancel_job",
         CommandKind::StandDown => "stand_down",
+        CommandKind::SharePut { .. } => "share_put",
+        CommandKind::ShareGet { .. } => "share_get",
     }
 }
 
@@ -1139,6 +1259,7 @@ async fn main() -> Result<()> {
         max_exec_secs: bounded_env("CONTROL_MAX_EXEC_SECS", 300, 1, 3_600)?,
         max_wait_secs: bounded_env("CONTROL_MAX_WAIT_SECS", 430, 10, 7_200)?,
         max_transfer_secs: bounded_env("CONTROL_MAX_TRANSFER_SECS", 1_800, 10, 86_400)?,
+        share_retention_days: bounded_env("CONTROL_SHARE_RETENTION_DAYS", 7, 0, 3_650)?,
         // Starting interval only; await_response doubles it up to a ceiling.
         poll_interval: Duration::from_millis(bounded_env("CONTROL_POLL_MS", 200, 100, 60_000)?),
     };

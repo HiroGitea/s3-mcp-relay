@@ -46,7 +46,11 @@ impl Registry {
                release TEXT PRIMARY KEY, version TEXT NOT NULL, target TEXT NOT NULL,
                sha256 TEXT NOT NULL, published_at INTEGER NOT NULL, completed_at INTEGER
              );
-             CREATE INDEX IF NOT EXISTS rollouts_version ON rollouts(version, target);"
+             CREATE INDEX IF NOT EXISTS rollouts_version ON rollouts(version, target);
+             -- Small key/value store. Holds the shared-area key, which has to
+             -- survive restarts: what one agent wrote yesterday is unreadable
+             -- without the same key today.
+             CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY, value TEXT NOT NULL);"
         )?;
         Ok(this)
     }
@@ -134,6 +138,30 @@ impl Registry {
             params![release, at],
         )?;
         Ok(())
+    }
+
+    /// The key the shared area is sealed with, minted on first use.
+    ///
+    /// Deliberately one key for the whole fleet: a shared area only its author
+    /// can decrypt is not shared. That makes it a genuine widening — any
+    /// enrolled agent can read everything in it — so it is kept here, handed
+    /// out only inside per-agent sealed commands, and used for nothing else.
+    pub fn share_key(&self) -> Result<String> {
+        let conn = Connection::open(&self.path)?;
+        let existing: Option<String> = conn
+            .query_row("SELECT value FROM settings WHERE name='share_key'", [], |row| row.get(0))
+            .ok();
+        if let Some(key) = existing {
+            return Ok(key);
+        }
+        let key = common::update::new_release_key();
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(name,value) VALUES('share_key',?1)",
+            params![key],
+        )?;
+        // Re-read rather than returning what we generated: another process may
+        // have inserted first, and both sides must end up with the same key.
+        Ok(conn.query_row("SELECT value FROM settings WHERE name='share_key'", [], |row| row.get(0))?)
     }
 
     /// Whether this version has already been rolled out to this platform.

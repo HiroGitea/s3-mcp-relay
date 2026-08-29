@@ -33,6 +33,13 @@ allow_insecure_http = false
 # rotate RELAY_SHARED_KEY.
 key_id = "primary"
 
+# Chunk uploads kept in flight at once. Higher helps most on a high-latency
+# path, where one stream spends its time waiting rather than sending. Bounded
+# by memory, not bandwidth: every upload in flight holds plaintext and
+# ciphertext, so this is clamped to fit a 256 MB budget — at the 8 MiB chunk
+# size that means 16, however much you ask for.
+upload_concurrency = 8
+
 # ---------------------------------------------------------------------------
 # Controller side (the MCP server Claude launches). Ignored by the agent.
 # ---------------------------------------------------------------------------
@@ -76,6 +83,11 @@ cleanup_check_secs = 300
 # comes back to no manifest and stays on its old binary until something is
 # published again — raise it if your fleet has machines that sleep for weeks.
 update_seen_days = 3
+
+# How long a file published with share_put stays in the shared area. The
+# cleanup loop removes expired entries, and chunks from an upload that died
+# once they have been untouched for a day.
+share_retention_days = 7
 
 # Watch a GitHub repository and publish each new release to the fleet without
 # being asked. Left unset the feature is off, which is the right default: this

@@ -25,7 +25,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
-use crate::protocol::{now_unix, UpdateManifest};
+use crate::protocol::{now_unix, validate_share_name, ShareManifest, UpdateManifest};
 use crate::{
     validate_agent_id, validate_transfer_id, Command, Crypto, Doorbell, Heartbeat, LogChunk, Response,
     S3Config,
@@ -476,6 +476,171 @@ impl Transport {
         for key in self.list_keys(&self.release_prefix(release)).await? {
             if let Err(error) = self.delete_key(&key).await {
                 tracing::warn!(%key, %error, "could not delete release chunk");
+            }
+        }
+        Ok(())
+    }
+
+    // --- Shared area --------------------------------------------------------
+    //
+    //   share/<name>/manifest   what the file is, and its hash
+    //   share/<name>/<index>    the bytes
+    //
+    // Both sealed with a key the controller keeps and hands out inside sealed
+    // commands, so every agent can read what any other agent wrote while the
+    // bucket still holds nothing readable. That key is fleet-wide by necessity
+    // — a shared area that only its author can decrypt is not shared — which
+    // makes it a real widening: any agent can read everything here, and one
+    // compromised agent exposes the lot. It is not used for anything else.
+    //
+    // Unlike `blob/`, nothing here is consumed on read. A shared file stays
+    // until it is explicitly removed.
+
+    fn share_prefix(&self, name: &str) -> String {
+        format!("{}share/{name}/", self.prefix)
+    }
+
+    fn share_manifest_key(&self, name: &str) -> String {
+        format!("{}manifest", self.share_prefix(name))
+    }
+
+    fn share_chunk_key(&self, name: &str, index: u32) -> String {
+        format!("{}{index:08}", self.share_prefix(name))
+    }
+
+    pub async fn put_share_chunk(
+        &self,
+        name: &str,
+        index: u32,
+        data: &[u8],
+        crypto: &Crypto,
+    ) -> Result<()> {
+        validate_share_name(name)?;
+        if data.len() > MAX_BLOB_CHUNK_BYTES {
+            anyhow::bail!("share chunk exceeds {MAX_BLOB_CHUNK_BYTES} bytes");
+        }
+        let key = self.share_chunk_key(name, index);
+        let body = crypto.seal_bytes(&key, data)?;
+        self.client.put_object().bucket(&self.bucket).key(&key)
+            .content_type("application/vnd.s3-mcp-relay.chunk")
+            .body(ByteStream::from(body)).send().await
+            .with_context(|| format!("put_object {key}"))?;
+        Ok(())
+    }
+
+    pub async fn get_share_chunk(
+        &self,
+        name: &str,
+        index: u32,
+        crypto: &Crypto,
+    ) -> Result<Option<Vec<u8>>> {
+        validate_share_name(name)?;
+        let key = self.share_chunk_key(name, index);
+        match self.get_raw(&key, MAX_BLOB_CHUNK_BYTES).await? {
+            Some(bytes) => Ok(Some(crypto.open_bytes(&key, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Written last, after every chunk is in place: a reader that finds a
+    /// manifest can rely on the bytes it describes already being there.
+    pub async fn put_share_manifest(&self, manifest: &ShareManifest, crypto: &Crypto) -> Result<()> {
+        validate_share_name(&manifest.name)?;
+        let key = self.share_manifest_key(&manifest.name);
+        let body = crypto.seal(&key, manifest)?;
+        self.client.put_object().bucket(&self.bucket).key(&key)
+            .content_type("application/vnd.s3-mcp-relay.encrypted+json")
+            .body(ByteStream::from(body)).send().await
+            .with_context(|| format!("put_object {key}"))?;
+        Ok(())
+    }
+
+    pub async fn read_share_manifest(
+        &self,
+        name: &str,
+        crypto: &Crypto,
+    ) -> Result<Option<ShareManifest>> {
+        validate_share_name(name)?;
+        let key = self.share_manifest_key(name);
+        let Some(bytes) = self.get_raw(&key, MAX_RELAY_OBJECT_BYTES).await? else {
+            return Ok(None);
+        };
+        let manifest: ShareManifest = crypto.open(&key, &bytes)?;
+        if manifest.name != name {
+            anyhow::bail!("share manifest at {key} names a different file");
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Names currently in the shared area, taken from which manifests exist.
+    pub async fn list_shares(&self) -> Result<Vec<String>> {
+        let prefix = format!("{}share/", self.prefix);
+        let mut names = Vec::new();
+        for key in self.list_keys(&prefix).await? {
+            if let Some(rest) = key.strip_prefix(&prefix) {
+                if let Some(name) = rest.strip_suffix("/manifest") {
+                    if validate_share_name(name).is_ok() {
+                        names.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Share prefixes that hold chunks but no manifest, and have been quiet
+    /// for longer than `grace`.
+    ///
+    /// A manifest is written only after every chunk lands, so chunks without
+    /// one mean an upload that died partway — invisible to `list_shares`, and
+    /// paying for storage forever. The grace period is what separates that from
+    /// an upload still in progress, which looks identical from here; a large
+    /// dataset over a slow link can legitimately take hours.
+    pub async fn list_share_orphans(&self, grace: std::time::Duration) -> Result<Vec<String>> {
+        let prefix = format!("{}share/", self.prefix);
+        let cutoff = now_unix().saturating_sub(grace.as_secs() as i64);
+        // name -> (has manifest, newest object time)
+        let mut seen: std::collections::HashMap<String, (bool, i64)> =
+            std::collections::HashMap::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = self.client.list_objects_v2().bucket(&self.bucket).prefix(&prefix);
+            if let Some(value) = &token { request = request.continuation_token(value); }
+            let out = request.send().await.with_context(|| format!("list_objects_v2 {prefix}"))?;
+            for object in out.contents() {
+                let Some(key) = object.key() else { continue };
+                let Some(rest) = key.strip_prefix(&prefix) else { continue };
+                let Some((name, leaf)) = rest.split_once('/') else { continue };
+                if validate_share_name(name).is_err() {
+                    continue;
+                }
+                let at = object.last_modified().map(|t| t.secs()).unwrap_or(0);
+                let entry = seen.entry(name.to_owned()).or_insert((false, 0));
+                entry.0 |= leaf == "manifest";
+                entry.1 = entry.1.max(at);
+            }
+            if out.is_truncated().unwrap_or(false) {
+                token = out.next_continuation_token().map(ToOwned::to_owned);
+            } else { break; }
+        }
+        let mut orphans: Vec<String> = seen
+            .into_iter()
+            .filter(|(_, (has_manifest, newest))| !has_manifest && *newest < cutoff)
+            .map(|(name, _)| name)
+            .collect();
+        orphans.sort();
+        Ok(orphans)
+    }
+
+    pub async fn delete_share(&self, name: &str) -> Result<()> {
+        validate_share_name(name)?;
+        // Manifest first: a half-deleted share should look absent rather than
+        // look present and then fail on a missing chunk.
+        let _ = self.delete_key(&self.share_manifest_key(name)).await;
+        for key in self.list_keys(&self.share_prefix(name)).await? {
+            if let Err(error) = self.delete_key(&key).await {
+                tracing::warn!(%key, %error, "could not delete share object");
             }
         }
         Ok(())
